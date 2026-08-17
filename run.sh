@@ -2,7 +2,7 @@
 
 mkdir -p /share/ota_server/firmware
 
-echo "Starting ESP OTA HTTPS Server"
+echo "Starting OTA Server"
 
 ls -la /share/ota_server/cert
 ls -la /share/ota_server/firmware
