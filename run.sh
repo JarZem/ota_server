@@ -1,11 +1,11 @@
 #!/bin/sh
 
-mkdir -p /share/esp_ota/firmware
+mkdir -p /share/ota_server/firmware
 
 echo "Starting ESP OTA HTTPS Server"
 
-ls -la /share/esp_ota/cert
-ls -la /share/esp_ota/firmware
+ls -la /share/ota_server/cert
+ls -la /share/ota_server/firmware
 
 echo "esptool:"
 esptool version
