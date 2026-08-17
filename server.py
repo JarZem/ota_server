@@ -2559,8 +2559,8 @@ def start_servers():
     )
 
     context.load_cert_chain(
-        certfile="/share/esp_ota/cert/ota-server.crt",
-        keyfile="/share/esp_ota/cert/ota-server.key"
+        certfile=CERT_FILE,
+        keyfile=KEY_FILE
     )
 
     ota_server.socket = context.wrap_socket(
@@ -2579,12 +2579,12 @@ def start_servers():
     ).start()
 
     print(
-        f"ESP OTA HTTPS server running on port {HTTPS_PORT}",
+        f"OTA server is running on port {HTTPS_PORT}",
         flush=True
     )
 
     print(
-        f"ESP OTA UI running on port {UI_PORT}",
+        f"OTA server UI running on port {UI_PORT}",
         flush=True
     )
 
