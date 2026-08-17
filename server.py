@@ -54,8 +54,8 @@ SERVER_SIGN_KEY_ID = 1
 SERVER_SIGN_PRIVATE_KEY_PATH = "/data/server_sign_p256.pem"
 SERVER_SIGN_PUBLIC_KEY_PATH = "/data/server_sign_p256.pub"
 
-CERT_FILE="/share/ota_server/cert/ota_cert.pem"
-KEY_FILE="/share/ota_server/cert/ota_private.pem"
+CERT_FILE="/share/ota_server/cert/ota_server_cert.pem"
+KEY_FILE="/share/ota_server/cert/ota_server_private.pem"
 
 DEVICE_MODEL_PREFIX = "ESP32-C6-"
 DEFAULT_OTA_ECOSYSTEM = "JaroslavZemanESP"
