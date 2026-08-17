@@ -1,0 +1,50 @@
+name: "ESP OTA Server"
+version: "0.1.12"
+slug: "esp_ota"
+description: "OTA server pro ESP32-C6"
+
+arch:
+  - amd64
+
+startup: services
+boot: auto
+
+ports:
+  8443/tcp: 8443
+
+map:
+  - type: share
+    read_only: false
+
+homeassistant_api: true
+
+ingress: true
+ingress_port: 8099
+
+panel_icon: mdi:update
+panel_title: "OTA server for ESP32-C6"
+panel_admin: true
+
+options:
+  ota_ecosystem: "JaroslavZemanESP"
+  wifi_ssid: "zeman"
+  wifi_password_secret: "main_wifi"
+  wifi_security: "WPA2"
+  wifi_channel: 13
+  ota_host: "192.168.2.120"
+  ota_port: 8443
+  mqtt_host: "core-mosquitto"
+  mqtt_port: 1883
+  mqtt_base_topic: "zigbee2mqtt"
+
+schema:
+  ota_ecosystem: str
+  wifi_ssid: str
+  wifi_password_secret: str
+  wifi_security: str
+  wifi_channel: int
+  ota_host: str
+  ota_port: port
+  mqtt_host: str
+  mqtt_port: port
+  mqtt_base_topic: str
