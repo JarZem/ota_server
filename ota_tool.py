@@ -10,7 +10,7 @@ import urllib.request
 
 from device_enrollment import derive_device_auth_secret, normalize_device_id
 
-DB_PATH = os.environ.get("ESP_OTA_DB", "/data/esp_ota.db")
+DB_PATH = os.environ.get("OTA_SERVER_DB", "/data/ota_server.db")
 SERVER_DEVICE_MASTER_SECRET_PATH = os.environ.get(
     "SERVER_DEVICE_MASTER_SECRET_PATH",
     "/data/server_device_master_secret.bin",
@@ -120,4 +120,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
