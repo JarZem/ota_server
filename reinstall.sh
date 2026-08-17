@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-APP="local_esp_ota"
+APP="local_ota_server"
 
 echo "Zastavuji $APP..."
 ha apps stop "$APP" 2>/dev/null || true
