@@ -39,10 +39,10 @@ from ota_helper import (
 HTTPS_PORT = 8443
 UI_PORT = 8099
 
-FIRMWARE_DIR = "/share/esp_ota/firmware"
-DB_PATH = "/data/esp_ota.db"
+FIRMWARE_DIR = "/share/ota_server/firmware"
+DB_PATH = "/data/ota_server.db"
 ADDON_OPTIONS_PATH = "/data/options.json"
-SECRETS_PATH = "/share/esp_ota/secrets.json"
+SECRETS_PATH = "/share/ota_server/secrets.json"
 
 TOKEN_TTL = 300
 TOKEN_BUCKET_SECONDS = 300
@@ -53,6 +53,9 @@ SERVER_DEVICE_MASTER_SECRET_PATH = "/data/server_device_master_secret.bin"
 SERVER_SIGN_KEY_ID = 1
 SERVER_SIGN_PRIVATE_KEY_PATH = "/data/server_sign_p256.pem"
 SERVER_SIGN_PUBLIC_KEY_PATH = "/data/server_sign_p256.pub"
+
+CERT_FILE="/share/ota_server/cert/ota_cert.pem"
+KEY_FILE="/share/ota_server/cert/ota_private.pem"
 
 DEVICE_MODEL_PREFIX = "ESP32-C6-"
 DEFAULT_OTA_ECOSYSTEM = "JaroslavZemanESP"
