@@ -1,7 +1,7 @@
-name: "ESP OTA Server"
-version: "0.1.12"
-slug: "esp_ota"
-description: "OTA server pro ESP32-C6"
+name: "OTA Server"
+version: "0.1.13"
+slug: "ota_server"
+description: "OTA server"
 
 arch:
   - amd64
@@ -22,7 +22,7 @@ ingress: true
 ingress_port: 8099
 
 panel_icon: mdi:update
-panel_title: "OTA server for ESP32-C6"
+panel_title: "OTA server"
 panel_admin: true
 
 options:
