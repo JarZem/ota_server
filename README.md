@@ -9,8 +9,8 @@ The OTA server uses its own private certificate authority (CA). The server certi
 The server expects:
 
 ```text
-/share/esp_ota/cert/ota-server.crt
-/share/esp_ota/cert/ota-server.key
+/share/ota_server/cert/ota-server.crt
+/share/ota_server/cert/ota-server.key
 ```
 
 Use `setup_certificates.py` to create the CA and OTA server certificate automatically.
@@ -46,7 +46,7 @@ cert/
 `ota-server.crt` and `ota-server.key` are used by the HTTPS OTA server. Copy them to:
 
 ```text
-/share/esp_ota/cert/
+/share/ota_server/cert/
 ```
 
 The server certificate contains the entered OTA server IP address as an IP Subject Alternative Name (SAN). No DNS or mDNS hostname is required.
