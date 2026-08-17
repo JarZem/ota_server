@@ -1,9 +1,15 @@
-# Lok�ln� z�lohy
+# Lokální zálohy
 .backup/
 
 # Python cache
 __pycache__/
 *.py[cod]
 
-# Markdown dokumentace generovan� Copilotem
+# Markdown dokumentace generovaná Copilotem
 *.md
+!README.md
+
+# Vygenerované certifikáty a privátní klíče
+cert/
+*.key
+*.pem
