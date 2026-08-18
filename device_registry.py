@@ -47,19 +47,30 @@ def _san_metadata(cert: x509.Certificate) -> dict[str, str]:
     return result
 
 
+def _certificate_validity_utc(cert: x509.Certificate) -> tuple[datetime, datetime]:
+    # cryptography >= 42 exposes timezone-aware UTC properties. Use them directly
+    # when available so deprecated naive datetime properties are never evaluated.
+    if hasattr(cert, 'not_valid_before_utc') and hasattr(cert, 'not_valid_after_utc'):
+        return cert.not_valid_before_utc, cert.not_valid_after_utc
+    return (
+        cert.not_valid_before.replace(tzinfo=timezone.utc),
+        cert.not_valid_after.replace(tzinfo=timezone.utc),
+    )
+
+
 def verify_and_extract_device_certificate(certificate_pem: bytes) -> dict:
     root = x509.load_pem_x509_certificate(ROOT_CA_PATH.read_bytes())
     cert = x509.load_pem_x509_certificate(certificate_pem)
 
     if cert.issuer != root.subject:
         raise ValueError('certificate issuer does not match configured Root CA')
-    if not isinstance(root.public_key(), ec.EllipticCurvePublicKey):
+    root_public_key = root.public_key()
+    if not isinstance(root_public_key, ec.EllipticCurvePublicKey):
         raise ValueError('Root CA public key is not EC')
-    root.public_key().verify(cert.signature, cert.tbs_certificate_bytes, ec.ECDSA(cert.signature_hash_algorithm))
+    root_public_key.verify(cert.signature, cert.tbs_certificate_bytes, ec.ECDSA(cert.signature_hash_algorithm))
 
     now = datetime.now(timezone.utc)
-    not_before = getattr(cert, 'not_valid_before_utc', cert.not_valid_before.replace(tzinfo=timezone.utc))
-    not_after = getattr(cert, 'not_valid_after_utc', cert.not_valid_after.replace(tzinfo=timezone.utc))
+    not_before, not_after = _certificate_validity_utc(cert)
     if now < not_before or now > not_after:
         raise ValueError('device certificate is outside its validity period')
 
@@ -119,6 +130,16 @@ def verify_and_extract_device_certificate(certificate_pem: bytes) -> dict:
         'certificate_not_after': int(not_after.timestamp()),
         'certificate_subject': cert.subject.rfc4514_string(),
         'certificate_issuer': cert.issuer.rfc4514_string(),
+        'verification': {
+            'root_ca_signature': 'OK',
+            'validity': 'OK',
+            'ca': False,
+            'digital_signature': True,
+            'eku': 'clientAuth',
+            'key': 'P-256',
+            'role': 'device',
+            'identity': device_id,
+        },
     }
 
 
@@ -157,7 +178,21 @@ def register_device_certificate(certificate_pem: bytes) -> dict:
     record = verify_and_extract_device_certificate(certificate_pem)
     now = int(datetime.now(timezone.utc).timestamp())
     init_registry()
+
     with _lock, sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        existing = conn.execute(
+            'SELECT certificate_fingerprint FROM device_certificates WHERE device_id=?',
+            (record['device_id'],),
+        ).fetchone()
+
+        if existing is None:
+            registration_status = 'REGISTERED'
+        elif existing['certificate_fingerprint'] == record['certificate_fingerprint']:
+            registration_status = 'UNCHANGED'
+        else:
+            registration_status = 'REPLACED'
+
         conn.execute('''
             INSERT INTO device_certificates (
                 device_id, ecosystem, device_group, device_model, product_role,
@@ -182,7 +217,11 @@ def register_device_certificate(certificate_pem: bytes) -> dict:
                 certificate_not_after=excluded.certificate_not_after,
                 certificate_subject=excluded.certificate_subject,
                 certificate_issuer=excluded.certificate_issuer,
-                last_hello_counter=0,
+                last_hello_counter=CASE
+                    WHEN device_certificates.certificate_fingerprint = excluded.certificate_fingerprint
+                    THEN device_certificates.last_hello_counter
+                    ELSE 0
+                END,
                 updated_at=excluded.updated_at
         ''', (
             record['device_id'], record['ecosystem'], record['device_group'],
@@ -193,6 +232,8 @@ def register_device_certificate(certificate_pem: bytes) -> dict:
             record['certificate_not_after'], record['certificate_subject'],
             record['certificate_issuer'], now, now,
         ))
+
+    record['registration_status'] = registration_status
     return record
 
 
@@ -203,6 +244,22 @@ def get_registered_device(device_id: str) -> dict | None:
         conn.row_factory = sqlite3.Row
         row = conn.execute('SELECT * FROM device_certificates WHERE device_id=?', (normalized,)).fetchone()
     return dict(row) if row else None
+
+
+def list_registered_devices() -> list[dict]:
+    init_registry()
+    with _lock, sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute('''
+            SELECT
+                device_id, ecosystem, device_group, device_model, product_role,
+                hardware_revision, chip_family, flash_size,
+                certificate_fingerprint, certificate_not_before, certificate_not_after,
+                last_hello_counter, registered_at, updated_at
+            FROM device_certificates
+            ORDER BY device_id
+        ''').fetchall()
+    return [dict(row) for row in rows]
 
 
 def accept_hello_counter(device_id: str, counter: int) -> bool:
