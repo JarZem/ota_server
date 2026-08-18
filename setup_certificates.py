@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import getpass
 import ipaddress
+import shutil
 import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -41,8 +42,8 @@ def write_private_key(path: Path, key: ec.EllipticCurvePrivateKey, password: byt
 
 def create_root_ca(ca_dir: Path, ecosystem: str) -> tuple[x509.Certificate, ec.EllipticCurvePrivateKey]:
     print('No Root CA exists yet. This creates the offline Root CA; keep its private key away from Home Assistant and Git.')
-    password1 = getpass.getpass('New Root CA private key password: ')
-    password2 = getpass.getpass('Repeat Root CA private key password: ')
+    password1 = getpass.getpass('New password protecting root_ca_private.pem: ')
+    password2 = getpass.getpass('Repeat password protecting root_ca_private.pem: ')
     if not password1 or password1 != password2:
         raise RuntimeError('Root CA password is empty or does not match')
 
@@ -88,7 +89,9 @@ def load_root_ca(ca_dir: Path, ecosystem: str, allow_create: bool) -> tuple[x509
         return create_root_ca(ca_dir, ecosystem)
 
     cert = x509.load_pem_x509_certificate(cert_path.read_bytes())
-    password_text = getpass.getpass('Root CA private key password (empty only if key is unencrypted): ')
+    print('\nThe next password only unlocks the existing root_ca_private.pem so this script can sign a certificate.')
+    print('It is not stored, copied to Home Assistant, or sent over the network.')
+    password_text = getpass.getpass('Password protecting root_ca_private.pem (leave empty only if that key is unencrypted): ')
     password = password_text.encode('utf-8') if password_text else None
     key = serialization.load_pem_private_key(key_path.read_bytes(), password=password)
     if not isinstance(key, ec.EllipticCurvePrivateKey):
@@ -145,18 +148,67 @@ def issue_ota_certificate(ca_cert: x509.Certificate, ca_key: ec.EllipticCurvePri
     print(f'OTA certificate SHA256: {ota_cert.fingerprint(hashes.SHA256()).hex()}')
 
 
-def deploy_to_home_assistant(output_dir: Path, ssh_target: str, ssh_key: str | None) -> None:
-    ssh_args = ['ssh']
-    scp_args = ['scp']
+def ssh_base_args(ssh_key: str | None) -> list[str]:
+    args = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8']
     if ssh_key:
-        ssh_args += ['-i', ssh_key]
-        scp_args += ['-i', ssh_key]
-    subprocess.run(ssh_args + [ssh_target, f'mkdir -p {REMOTE_CERT_DIR} && chmod 700 {REMOTE_CERT_DIR}'], check=True)
+        args += ['-i', ssh_key]
+    return args
+
+
+def scp_base_args(ssh_key: str | None) -> list[str]:
+    args = ['scp', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8']
+    if ssh_key:
+        args += ['-i', ssh_key]
+    return args
+
+
+def preflight_home_assistant(ssh_target: str, ssh_key: str | None) -> None:
+    if shutil.which('ssh') is None:
+        raise RuntimeError('SSH client was not found in PATH')
+    if shutil.which('scp') is None:
+        raise RuntimeError('SCP client was not found in PATH')
+    if ssh_key and not Path(ssh_key).expanduser().is_file():
+        raise RuntimeError(f'SSH private key does not exist: {ssh_key}')
+
+    print(f'Checking SSH access to {ssh_target} ...')
+    probe = (
+        f'mkdir -p {REMOTE_CERT_DIR} && '
+        f'test -d {REMOTE_CERT_DIR} && '
+        f'test -w {REMOTE_CERT_DIR} && '
+        f'probe={REMOTE_CERT_DIR}/.ota_cert_write_test_$$ && '
+        f': > "$probe" && rm -f "$probe"'
+    )
+    result = subprocess.run(
+        ssh_base_args(ssh_key) + [ssh_target, probe],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise RuntimeError(
+            f'Home Assistant deploy preflight failed for {ssh_target}:{REMOTE_CERT_DIR}: {detail or "SSH/path write test failed"}'
+        )
+    print(f'PASS SSH login and write access to {ssh_target}:{REMOTE_CERT_DIR}')
+
+
+def deploy_to_home_assistant(output_dir: Path, ssh_target: str, ssh_key: str | None) -> None:
     files = [ROOT_CA_CERT_NAME, OTA_CERT_NAME, OTA_KEY_NAME, OTA_PUBLIC_NAME]
-    subprocess.run(scp_args + [str(output_dir / name) for name in files] + [f'{ssh_target}:{REMOTE_CERT_DIR}/'], check=True)
-    subprocess.run(ssh_args + [ssh_target,
-        f'chmod 600 {REMOTE_CERT_DIR}/{OTA_KEY_NAME}; '
-        f'chmod 644 {REMOTE_CERT_DIR}/{ROOT_CA_CERT_NAME} {REMOTE_CERT_DIR}/{OTA_CERT_NAME} {REMOTE_CERT_DIR}/{OTA_PUBLIC_NAME}'], check=True)
+    for name in files:
+        path = output_dir / name
+        if not path.is_file():
+            raise RuntimeError(f'Deploy source file is missing: {path}')
+
+    subprocess.run(
+        scp_base_args(ssh_key) + [str(output_dir / name) for name in files] + [f'{ssh_target}:{REMOTE_CERT_DIR}/'],
+        check=True,
+    )
+    subprocess.run(
+        ssh_base_args(ssh_key) + [ssh_target,
+            f'chmod 600 {REMOTE_CERT_DIR}/{OTA_KEY_NAME}; '
+            f'chmod 644 {REMOTE_CERT_DIR}/{ROOT_CA_CERT_NAME} {REMOTE_CERT_DIR}/{OTA_CERT_NAME} {REMOTE_CERT_DIR}/{OTA_PUBLIC_NAME}'],
+        check=True,
+    )
     print(f'OTA certificate material deployed to {ssh_target}:{REMOTE_CERT_DIR}/')
 
 
@@ -177,12 +229,16 @@ def main() -> None:
     ca_dir = (args.ca_dir or Path(ask('Offline CA directory', './ca'))).expanduser().resolve()
     output_dir = (args.out or Path(ask('OTA certificate output directory', './ota_credentials'))).expanduser().resolve()
 
+    ssh_target = args.ssh_target or ask('Deploy to Home Assistant over SSH now (target, empty = no)', '')
+    ssh_key = None
+    if ssh_target:
+        ssh_key = args.ssh_key or ask('SSH private key path (empty = SSH default)', '') or None
+        preflight_home_assistant(ssh_target, ssh_key)
+
     ca_cert, ca_key = load_root_ca(ca_dir, ecosystem, args.init_ca)
     issue_ota_certificate(ca_cert, ca_key, ecosystem, ota_ip, output_dir)
 
-    ssh_target = args.ssh_target or ask('Deploy to Home Assistant over SSH now (target, empty = no)', '')
     if ssh_target:
-        ssh_key = args.ssh_key or ask('SSH private key path (empty = SSH default)', '') or None
         deploy_to_home_assistant(output_dir, ssh_target, ssh_key)
 
     print('\nCreated/required layout:')
