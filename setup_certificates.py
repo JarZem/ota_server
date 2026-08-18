@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import getpass
 import ipaddress
-import secrets
 import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -21,7 +20,6 @@ ROOT_CA_KEY_NAME = 'root_ca_private.pem'
 OTA_CERT_NAME = 'ota_server_cert.pem'
 OTA_KEY_NAME = 'ota_server_private.pem'
 OTA_PUBLIC_NAME = 'ota_server_public.pem'
-MANUFACTURING_TOKEN_NAME = 'manufacturing_token.txt'
 REMOTE_CERT_DIR = '/share/ota_server/cert'
 ROLE_URI = 'urn:esp-pki:role:ota-server'
 
@@ -143,14 +141,6 @@ def issue_ota_certificate(ca_cert: x509.Certificate, ca_key: ec.EllipticCurvePri
     ))
     (output_dir / ROOT_CA_CERT_NAME).write_bytes(ca_cert.public_bytes(serialization.Encoding.PEM))
 
-    token_path = output_dir / MANUFACTURING_TOKEN_NAME
-    if not token_path.exists():
-        token_path.write_text(secrets.token_urlsafe(48) + '\n', encoding='utf-8')
-        try:
-            token_path.chmod(0o600)
-        except OSError:
-            pass
-
     print(f'OTA certificate role: {ROLE_URI}')
     print(f'OTA certificate SHA256: {ota_cert.fingerprint(hashes.SHA256()).hex()}')
 
@@ -162,10 +152,10 @@ def deploy_to_home_assistant(output_dir: Path, ssh_target: str, ssh_key: str | N
         ssh_args += ['-i', ssh_key]
         scp_args += ['-i', ssh_key]
     subprocess.run(ssh_args + [ssh_target, f'mkdir -p {REMOTE_CERT_DIR} && chmod 700 {REMOTE_CERT_DIR}'], check=True)
-    files = [ROOT_CA_CERT_NAME, OTA_CERT_NAME, OTA_KEY_NAME, OTA_PUBLIC_NAME, MANUFACTURING_TOKEN_NAME]
+    files = [ROOT_CA_CERT_NAME, OTA_CERT_NAME, OTA_KEY_NAME, OTA_PUBLIC_NAME]
     subprocess.run(scp_args + [str(output_dir / name) for name in files] + [f'{ssh_target}:{REMOTE_CERT_DIR}/'], check=True)
     subprocess.run(ssh_args + [ssh_target,
-        f'chmod 600 {REMOTE_CERT_DIR}/{OTA_KEY_NAME} {REMOTE_CERT_DIR}/{MANUFACTURING_TOKEN_NAME}; '
+        f'chmod 600 {REMOTE_CERT_DIR}/{OTA_KEY_NAME}; '
         f'chmod 644 {REMOTE_CERT_DIR}/{ROOT_CA_CERT_NAME} {REMOTE_CERT_DIR}/{OTA_CERT_NAME} {REMOTE_CERT_DIR}/{OTA_PUBLIC_NAME}'], check=True)
     print(f'OTA certificate material deployed to {ssh_target}:{REMOTE_CERT_DIR}/')
 
@@ -201,7 +191,6 @@ def main() -> None:
     print(f'  OTA cert:     {output_dir / OTA_CERT_NAME}')
     print(f'  OTA key:      {output_dir / OTA_KEY_NAME}')
     print(f'  OTA public:   {output_dir / OTA_PUBLIC_NAME}')
-    print(f'  API token:    {output_dir / MANUFACTURING_TOKEN_NAME}')
     print('The Root CA private key is never copied to Home Assistant or ESP firmware.')
 
 
