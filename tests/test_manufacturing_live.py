@@ -16,7 +16,6 @@ import getpass
 import json
 import ssl
 import urllib.error
-import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -89,8 +88,7 @@ def post_certificate(base: str, root_ca_path: Path, cert_pem: bytes) -> tuple[in
         with urllib.request.urlopen(request, timeout=15, context=context(root_ca_path)) as response:
             return response.status, json.loads(response.read().decode('utf-8'))
     except urllib.error.HTTPError as exc:
-        payload = json.loads(exc.read().decode('utf-8'))
-        return exc.code, payload
+        return exc.code, json.loads(exc.read().decode('utf-8'))
 
 
 def san_uri_values(cert: x509.Certificate) -> list[str]:
@@ -141,21 +139,12 @@ def build_device_cert(ca_cert: x509.Certificate,
         .not_valid_after(now + timedelta(days=30))
         .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
         .add_extension(x509.KeyUsage(
-            digital_signature=True,
-            content_commitment=False,
-            key_encipherment=False,
-            data_encipherment=False,
-            key_agreement=False,
-            key_cert_sign=False,
-            crl_sign=False,
-            encipher_only=False,
-            decipher_only=False,
+            digital_signature=True, content_commitment=False, key_encipherment=False,
+            data_encipherment=False, key_agreement=False, key_cert_sign=False,
+            crl_sign=False, encipher_only=False, decipher_only=False,
         ), critical=True)
         .add_extension(x509.ExtendedKeyUsage(eku), critical=False)
-        .add_extension(
-            x509.SubjectAlternativeName([x509.UniformResourceIdentifier(uri) for uri in uris]),
-            critical=False,
-        )
+        .add_extension(x509.SubjectAlternativeName([x509.UniformResourceIdentifier(uri) for uri in uris]), critical=False)
         .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False)
         .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()), critical=False)
         .sign(ca_key, hashes.SHA256())
@@ -225,9 +214,7 @@ def main() -> None:
         fail(f'OTA certificate does not contain expected role URI {ROLE_OTA_URI}')
     print('PASS OTA server certificate chain, EKU and existing JarZem role URI')
 
-    ota_public_endpoint = serialization.load_pem_public_key(
-        get_bytes(base, '/api/manufacturing/ota-public.pem', root_ca_path)
-    )
+    ota_public_endpoint = serialization.load_pem_public_key(get_bytes(base, '/api/manufacturing/ota-public.pem', root_ca_path))
     cert_public = ota_cert.public_key()
     if not isinstance(ota_public_endpoint, ec.EllipticCurvePublicKey) or not isinstance(cert_public, ec.EllipticCurvePublicKey):
         fail('OTA public key is not EC')
@@ -240,7 +227,7 @@ def main() -> None:
     expected_fp = valid_cert.fingerprint(hashes.SHA256()).hex()
 
     status, registration = post_certificate(base, root_ca_path, valid_pem)
-    if status != 200 or registration.get('status') != 'REGISTERED':
+    if status != 200 or registration.get('status') not in ('REGISTERED', 'REPLACED'):
         fail(f'valid device registration failed HTTP={status} response={registration}')
     expected = {
         'device_id': TEST_DEVICE_ID,
@@ -256,12 +243,20 @@ def main() -> None:
     for key, value in expected.items():
         if registration.get(key) != value:
             fail(f'registration metadata mismatch {key}: {registration.get(key)!r} != {value!r}')
-    print('PASS valid CA-signed device certificate registration + metadata extraction')
+    print(f"PASS valid CA-signed device certificate registration + metadata extraction ({registration.get('status')})")
 
     status2, registration2 = post_certificate(base, root_ca_path, valid_pem)
-    if status2 != 200 or registration2.get('certificate_fingerprint') != expected_fp:
+    if status2 != 200 or registration2.get('status') != 'UNCHANGED' or registration2.get('certificate_fingerprint') != expected_fp:
         fail(f'idempotent re-registration failed HTTP={status2} response={registration2}')
-    print('PASS idempotent re-registration of the same device certificate')
+    print('PASS idempotent re-registration reports UNCHANGED')
+
+    registry = json.loads(get_bytes(base, '/api/manufacturing/devices', root_ca_path).decode('utf-8'))
+    registry_device = next((item for item in registry.get('devices', []) if item.get('device_id') == TEST_DEVICE_ID), None)
+    if registry.get('status') != 'OK' or registry_device is None:
+        fail(f'test device missing from registry endpoint: {registry}')
+    if registry_device.get('certificate_fingerprint') != expected_fp:
+        fail('registry endpoint fingerprint does not match registered certificate')
+    print('PASS registry read endpoint exposes the registered certificate metadata')
 
     untrusted = build_self_signed_invalid_cert(args.ecosystem)
     status3, response3 = post_certificate(base, root_ca_path, untrusted.public_bytes(serialization.Encoding.PEM))
