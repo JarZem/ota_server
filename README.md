@@ -194,13 +194,15 @@ The public Root CA + OTA certificate are also assembled into the HTTPS trust bun
 
 All generated files under `device_credentials/` are excluded from Git.
 
-After the firmware has been successfully flashed to the intended physical module, remove the workstation copy of its private key:
+After the firmware has been successfully flashed to the intended physical module, run:
 
 ```bash
 python tools/cleanup_device_credentials.py
 ```
 
-This deletes only `device_private.pem`. To remove the public build copies too:
+By default this deletes `device_private.pem` and the local ESP-IDF build directories, because the generated firmware image itself contains the embedded private key. Any `.bin` copied elsewhere must therefore also be treated as sensitive and deleted when it is no longer needed.
+
+To also remove the public certificate/build copies from `device_credentials/`:
 
 ```bash
 python tools/cleanup_device_credentials.py --all
@@ -212,7 +214,7 @@ The public `device_cert.pem` does not need to remain on the workstation because 
 
 Device ID, ecosystem, group, model, product role and hardware information are manufacturing facts. Putting them in the CA-signed device certificate means OTA receives those facts once through the trusted manufacturing path.
 
-Consequently the later Zigbee HELLO can stay small. It needs to prove freshness and possession of the device private key, not resend the certificate or all static hardware metadata. OTA can resolve the certificate and public key from its registry by `device_id` and verify the HELLO signature against the already registered identity.
+Consequently the Zigbee HELLO is small. It contains only protocol version, transaction id, device id, monotonic enrollment counter, random nonce and the fragmented ECDSA signature. The certificate, public key and static hardware metadata are resolved from the OTA registry and are not transported over Zigbee.
 
 ## Security rules
 
