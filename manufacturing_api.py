@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import hmac
 import http.server
 import json
-import os
 import ssl
 from pathlib import Path
 from urllib.parse import urlparse
@@ -18,15 +16,7 @@ CERT_DIR = Path('/share/ota_server/cert')
 OTA_CERT_PATH = CERT_DIR / 'ota_server_cert.pem'
 OTA_KEY_PATH = CERT_DIR / 'ota_server_private.pem'
 ROOT_CA_PATH = CERT_DIR / 'root_ca_cert.pem'
-MANUFACTURING_TOKEN_PATH = CERT_DIR / 'manufacturing_token.txt'
 MAX_REGISTER_BODY = 16 * 1024
-
-
-def load_token() -> str:
-    token = MANUFACTURING_TOKEN_PATH.read_text(encoding='utf-8').strip()
-    if len(token) < 32:
-        raise RuntimeError('manufacturing token is missing or too short')
-    return token
 
 
 def public_key_pem_from_certificate(cert_path: Path) -> bytes:
@@ -38,7 +28,7 @@ def public_key_pem_from_certificate(cert_path: Path) -> bytes:
 
 
 class ManufacturingHandler(http.server.BaseHTTPRequestHandler):
-    server_version = 'OTA-Manufacturing/1'
+    server_version = 'OTA-Manufacturing/2'
 
     def log_message(self, fmt, *args):
         print(f'MANUFACTURING {self.address_string()} - {fmt % args}', flush=True)
@@ -53,11 +43,6 @@ class ManufacturingHandler(http.server.BaseHTTPRequestHandler):
 
     def send_json(self, status: int, payload: dict) -> None:
         self.send_bytes(status, json.dumps(payload, separators=(',', ':')).encode('utf-8'), 'application/json')
-
-    def authorized(self) -> bool:
-        header = self.headers.get('Authorization', '')
-        expected = f'Bearer {load_token()}'
-        return hmac.compare_digest(header, expected)
 
     def do_GET(self):
         path = urlparse(self.path).path
@@ -75,9 +60,6 @@ class ManufacturingHandler(http.server.BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path != '/api/manufacturing/register-device':
             self.send_error(404, 'Not found')
-            return
-        if not self.authorized():
-            self.send_json(401, {'status': 'ERROR', 'error': 'unauthorized'})
             return
 
         try:
@@ -113,11 +95,15 @@ class ManufacturingHandler(http.server.BaseHTTPRequestHandler):
             'device_group': record['device_group'],
             'device_model': record['device_model'],
             'product_role': record['product_role'],
+            'hardware_revision': record['hardware_revision'],
+            'chip_family': record['chip_family'],
+            'flash_size': record['flash_size'],
+            'ecosystem': record['ecosystem'],
         })
 
 
 def main() -> None:
-    for path in (OTA_CERT_PATH, OTA_KEY_PATH, ROOT_CA_PATH, MANUFACTURING_TOKEN_PATH):
+    for path in (OTA_CERT_PATH, OTA_KEY_PATH, ROOT_CA_PATH):
         if not path.is_file():
             raise RuntimeError(f'missing manufacturing credential: {path}')
 
@@ -127,7 +113,7 @@ def main() -> None:
     context.load_cert_chain(str(OTA_CERT_PATH), str(OTA_KEY_PATH))
     server.socket = context.wrap_socket(server.socket, server_side=True)
     print(f'Manufacturing HTTPS API running on port {PORT}', flush=True)
-    print('Manufacturing public bootstrap endpoints are available; device registration requires bearer token', flush=True)
+    print('Manufacturing bootstrap and CA-validated device registration endpoints are available', flush=True)
     server.serve_forever()
 
 
