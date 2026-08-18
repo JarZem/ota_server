@@ -9,7 +9,7 @@ from urllib.parse import urlparse
 from cryptography import x509
 from cryptography.hazmat.primitives import serialization
 
-from device_registry import init_registry, register_device_certificate
+from device_registry import init_registry, list_registered_devices, register_device_certificate
 
 PORT = 8451
 CERT_DIR = Path('/share/ota_server/cert')
@@ -28,7 +28,7 @@ def public_key_pem_from_certificate(cert_path: Path) -> bytes:
 
 
 class ManufacturingHandler(http.server.BaseHTTPRequestHandler):
-    server_version = 'OTA-Manufacturing/2'
+    server_version = 'OTA-Manufacturing/3'
 
     def log_message(self, fmt, *args):
         print(f'MANUFACTURING {self.address_string()} - {fmt % args}', flush=True)
@@ -54,6 +54,13 @@ class ManufacturingHandler(http.server.BaseHTTPRequestHandler):
             return self.send_bytes(200, public_key_pem_from_certificate(OTA_CERT_PATH), 'application/x-pem-file')
         if path == '/api/manufacturing/health':
             return self.send_json(200, {'status': 'OK'})
+        if path == '/api/manufacturing/devices':
+            devices = list_registered_devices()
+            return self.send_json(200, {
+                'status': 'OK',
+                'count': len(devices),
+                'devices': devices,
+            })
         self.send_error(404, 'Not found')
 
     def do_POST(self):
@@ -75,21 +82,32 @@ class ManufacturingHandler(http.server.BaseHTTPRequestHandler):
             certificate_pem = str(request['device_certificate_pem']).encode('ascii')
             record = register_device_certificate(certificate_pem)
         except Exception as exc:
-            print(f'MANUFACTURING device certificate rejected: {exc}', flush=True)
+            print(f'MANUFACTURING certificate verification FAILED reason={exc}', flush=True)
             self.send_json(400, {'status': 'ERROR', 'error': str(exc)})
             return
 
+        verification = record['verification']
         print(
-            'MANUFACTURING device registered '
-            f"device_id={record['device_id']} ecosystem={record['ecosystem']} "
-            f"group={record['device_group']} model={record['device_model']} "
-            f"role={record['product_role']} hw={record['hardware_revision']} "
-            f"chip={record['chip_family']} flash={record['flash_size']} "
+            'MANUFACTURING certificate verification OK '
+            f"device_id={record['device_id']} "
+            f"root_ca_signature={verification['root_ca_signature']} "
+            f"validity={verification['validity']} ca={verification['ca']} "
+            f"digital_signature={verification['digital_signature']} "
+            f"eku={verification['eku']} key={verification['key']} "
+            f"role={verification['role']} identity={verification['identity']} "
             f"cert_sha256={record['certificate_fingerprint']}",
             flush=True,
         )
+        print(
+            f"MANUFACTURING device {record['registration_status']} "
+            f"device_id={record['device_id']} ecosystem={record['ecosystem']} "
+            f"group={record['device_group']} model={record['device_model']} "
+            f"role={record['product_role']} hw={record['hardware_revision']} "
+            f"chip={record['chip_family']} flash={record['flash_size']}",
+            flush=True,
+        )
         self.send_json(200, {
-            'status': 'REGISTERED',
+            'status': record['registration_status'],
             'device_id': record['device_id'],
             'certificate_fingerprint': record['certificate_fingerprint'],
             'device_group': record['device_group'],
@@ -113,7 +131,7 @@ def main() -> None:
     context.load_cert_chain(str(OTA_CERT_PATH), str(OTA_KEY_PATH))
     server.socket = context.wrap_socket(server.socket, server_side=True)
     print(f'Manufacturing HTTPS API running on port {PORT}', flush=True)
-    print('Manufacturing bootstrap and CA-validated device registration endpoints are available', flush=True)
+    print('Manufacturing bootstrap, registry read and CA-validated device registration endpoints are available', flush=True)
     server.serve_forever()
 
 
