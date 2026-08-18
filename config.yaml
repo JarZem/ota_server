@@ -1,5 +1,5 @@
 name: "OTA Server"
-version: "0.1.15"
+version: "0.1.16"
 slug: "ota_server"
 description: "OTA server"
 
@@ -11,6 +11,7 @@ boot: auto
 
 ports:
   8443/tcp: 8443
+  8451/tcp: 8451
 
 map:
   - type: share
