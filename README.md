@@ -1,6 +1,6 @@
 # OTA Server
 
-Home Assistant add-on providing HTTPS OTA firmware delivery, Zigbee2MQTT enrollment transport and a small manufacturing PKI service for ESP devices.
+Home Assistant add-on providing HTTPS OTA firmware delivery, Zigbee2MQTT enrollment transport and a manufacturing PKI service for ESP devices.
 
 ## Certificate architecture
 
@@ -19,7 +19,6 @@ HOME ASSISTANT / OTA
   /share/ota_server/cert/ota_server_cert.pem
   /share/ota_server/cert/ota_server_private.pem
   /share/ota_server/cert/ota_server_public.pem
-  /share/ota_server/cert/manufacturing_token.txt
   /data/device_registry.db  public ESP certificates and metadata
 
 ESP FLASH
@@ -70,7 +69,6 @@ ota_credentials/
   ota_server_cert.pem
   ota_server_private.pem
   ota_server_public.pem
-  manufacturing_token.txt
 ```
 
 The OTA certificate is P-256, has `serverAuth`, contains the configured IP SAN and the role URI:
@@ -81,31 +79,23 @@ urn:esp-pki:role:ota-server
 
 When `--ssh-target` is supplied, the script creates `/share/ota_server/cert/` and copies only the files OTA actually requires. It deliberately does not copy `root_ca_private.pem`.
 
-`manufacturing_token.txt` protects write access to the device-registration API. Treat it as a secret.
-
 ## 2. OTA manufacturing HTTPS service
 
-OTA add-on version 0.1.16 exposes a manufacturing service on HTTPS port `8451` using the normal OTA server TLS certificate.
+OTA add-on version 0.1.17 exposes a manufacturing service on HTTPS port `8451` using the normal OTA server TLS certificate.
 
-Public bootstrap endpoints:
+Public endpoints:
 
 ```text
 GET https://<ota-ip>:8451/api/manufacturing/root-ca.pem
 GET https://<ota-ip>:8451/api/manufacturing/ota-server.pem
 GET https://<ota-ip>:8451/api/manufacturing/ota-public.pem
 GET https://<ota-ip>:8451/api/manufacturing/health
-```
-
-These contain only public material.
-
-Device registration requires:
-
-```text
 POST https://<ota-ip>:8451/api/manufacturing/register-device
-Authorization: Bearer <manufacturing_token>
 ```
 
-The request contains the public `device_cert.pem`. OTA verifies that the certificate:
+There is no manufacturing bearer token. Registration transports only a public device certificate. The security boundary is the offline Root CA: OTA accepts a device certificate only when all certificate checks pass.
+
+For every registration OTA verifies that the certificate:
 
 - is signed by `/share/ota_server/cert/root_ca_cert.pem`;
 - is currently valid;
@@ -141,11 +131,10 @@ python tools/create_device_credentials.py \
   --flash-size 16MB \
   --ecosystem JaroslavZemanESP \
   --ca-dir D:/ESP-PKI/ca \
-  --ota-url https://192.168.2.120:8451 \
-  --manufacturing-token D:/ESP-PKI/ota_credentials/manufacturing_token.txt
+  --ota-url https://192.168.2.120:8451
 ```
 
-The device certificate itself contains stable manufacturing identity, so this information does not need to be repeated in normal Zigbee HELLO messages:
+The device certificate itself contains stable manufacturing identity:
 
 ```text
 Organization            ecosystem
@@ -173,13 +162,13 @@ device_credentials/
   ota_server_public.pem   public, fetched from OTA
 ```
 
-Then it immediately registers `device_cert.pem` with OTA over the authenticated manufacturing API. OTA therefore already knows the device certificate, public key and hardware/product metadata before the ESP ever sends its first Zigbee HELLO.
+Then it immediately registers `device_cert.pem` with OTA. OTA therefore already knows the device certificate, public key and hardware/product metadata before the ESP ever sends its first Zigbee HELLO.
 
 The script never uploads `device_private.pem`.
 
 ## 4. ESP build and flash
 
-The ESP project's CMake requires the generated `device_credentials/` workspace. Build fails if required files are missing.
+The ESP project's CMake invokes `tools/create_device_credentials.py` automatically when no device credential workspace exists. It refuses to regenerate an identity when only part of an existing credential set is present.
 
 CMake embeds into firmware:
 
@@ -202,15 +191,46 @@ python tools/cleanup_device_credentials.py
 
 By default this deletes `device_private.pem` and the local ESP-IDF build directories, because the generated firmware image itself contains the embedded private key. Any `.bin` copied elsewhere must therefore also be treated as sensitive and deleted when it is no longer needed.
 
-To also remove the public certificate/build copies from `device_credentials/`:
+## 5. Live manufacturing API test
 
-```bash
-python tools/cleanup_device_credentials.py --all
+The OTA repository contains:
+
+```text
+tests/test_manufacturing_live.py
 ```
 
-The public `device_cert.pem` does not need to remain on the workstation because OTA already stores it in `/data/device_registry.db`.
+Run it from the workstation that has the real offline CA and network access to the OTA service:
 
-## 5. Why device metadata is in the certificate
+```bash
+python tests/test_manufacturing_live.py \
+  --ota-url https://192.168.2.120:8451 \
+  --ca-dir D:/ESP-PKI/ca \
+  --ecosystem JaroslavZemanESP
+```
+
+The test uses TLS validation through the real Root CA and verifies the same OTA functions needed by the ESP provisioning script:
+
+- manufacturing health endpoint;
+- OTA exposes the same Root CA as the offline workstation;
+- OTA server certificate is signed by that CA, has `serverAuth` and role `ota-server`;
+- `ota-public.pem` matches the public key in `ota_server_cert.pem`;
+- a valid CA-signed P-256 device certificate registers successfully;
+- all certificate metadata is extracted correctly;
+- registering the same certificate again is idempotent;
+- an untrusted/self-signed certificate is rejected;
+- a CA-signed certificate with the wrong role is rejected;
+- a CA-signed certificate without `clientAuth` is rejected.
+
+The successful test registration uses the reserved test identity:
+
+```text
+02:00:00:00:00:00:00:01
+manufacturing-test
+```
+
+This keeps repeated runs deterministic and does not create a new registry entry every time.
+
+## 6. Why device metadata is in the certificate
 
 Device ID, ecosystem, group, model, product role and hardware information are manufacturing facts. Putting them in the CA-signed device certificate means OTA receives those facts once through the trusted manufacturing path.
 
@@ -223,10 +243,9 @@ Never commit or copy these outside their intended secure location:
 ```text
 root_ca_private.pem
 ota_server_private.pem
-manufacturing_token.txt
 device_private.pem
 ```
 
-The Root CA private key remains offline. Home Assistant receives only the public Root CA, OTA's own private key/certificate and the manufacturing API token. Each ESP receives only its own private key plus public certificates.
+The Root CA private key remains offline. Home Assistant receives only the public Root CA and OTA's own private key/certificate. Each ESP receives only its own private key plus public certificates.
 
 The Home Assistant host should keep a stable IP address, preferably by DHCP reservation, because the OTA TLS certificate contains that IP address as a SAN and ESP provisioning stores the OTA host address.
