@@ -8,6 +8,7 @@ COPY device_enrollment.py /
 COPY database.py /
 COPY device_registry.py /
 COPY manufacturing_api.py /
+COPY migrate_legacy_sqlite.py /
 COPY server.py /
 COPY server_mysql.py /
 COPY mqtt_listener.py /
