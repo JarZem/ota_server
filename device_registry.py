@@ -143,10 +143,14 @@ def init_registry() -> None:
                 certificate_not_after INTEGER NOT NULL,
                 certificate_subject TEXT NOT NULL,
                 certificate_issuer TEXT NOT NULL,
+                last_hello_counter INTEGER NOT NULL DEFAULT 0,
                 registered_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             )
         ''')
+        columns = {row[1] for row in conn.execute('PRAGMA table_info(device_certificates)')}
+        if 'last_hello_counter' not in columns:
+            conn.execute('ALTER TABLE device_certificates ADD COLUMN last_hello_counter INTEGER NOT NULL DEFAULT 0')
 
 
 def register_device_certificate(certificate_pem: bytes) -> dict:
@@ -160,8 +164,8 @@ def register_device_certificate(certificate_pem: bytes) -> dict:
                 hardware_revision, chip_family, flash_size, certificate_pem,
                 certificate_fingerprint, public_key_der, public_key_uncompressed,
                 certificate_not_before, certificate_not_after, certificate_subject,
-                certificate_issuer, registered_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                certificate_issuer, last_hello_counter, registered_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
             ON CONFLICT(device_id) DO UPDATE SET
                 ecosystem=excluded.ecosystem,
                 device_group=excluded.device_group,
@@ -178,6 +182,7 @@ def register_device_certificate(certificate_pem: bytes) -> dict:
                 certificate_not_after=excluded.certificate_not_after,
                 certificate_subject=excluded.certificate_subject,
                 certificate_issuer=excluded.certificate_issuer,
+                last_hello_counter=0,
                 updated_at=excluded.updated_at
         ''', (
             record['device_id'], record['ecosystem'], record['device_group'],
@@ -198,3 +203,17 @@ def get_registered_device(device_id: str) -> dict | None:
         conn.row_factory = sqlite3.Row
         row = conn.execute('SELECT * FROM device_certificates WHERE device_id=?', (normalized,)).fetchone()
     return dict(row) if row else None
+
+
+def accept_hello_counter(device_id: str, counter: int) -> bool:
+    normalized = normalize_device_id(device_id)
+    init_registry()
+    with _lock, sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute('SELECT last_hello_counter FROM device_certificates WHERE device_id=?', (normalized,)).fetchone()
+        if row is None or counter <= int(row[0]):
+            return False
+        conn.execute(
+            'UPDATE device_certificates SET last_hello_counter=?, updated_at=? WHERE device_id=?',
+            (counter, int(datetime.now(timezone.utc).timestamp()), normalized),
+        )
+    return True
