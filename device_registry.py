@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import sqlite3
-import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import unquote
@@ -11,10 +9,10 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import ExtendedKeyUsageOID, ExtensionOID, NameOID
 
-DB_PATH = Path('/data/device_registry.db')
+from database import db_connect
+
 ROOT_CA_PATH = Path('/share/ota_server/cert/root_ca_cert.pem')
 URI_PREFIX = 'urn:jarzem:esp:pki:'
-_lock = threading.Lock()
 
 
 def normalize_device_id(value: str) -> str:
@@ -47,30 +45,19 @@ def _san_metadata(cert: x509.Certificate) -> dict[str, str]:
     return result
 
 
-def _certificate_validity_utc(cert: x509.Certificate) -> tuple[datetime, datetime]:
-    # cryptography >= 42 exposes timezone-aware UTC properties. Use them directly
-    # when available so deprecated naive datetime properties are never evaluated.
-    if hasattr(cert, 'not_valid_before_utc') and hasattr(cert, 'not_valid_after_utc'):
-        return cert.not_valid_before_utc, cert.not_valid_after_utc
-    return (
-        cert.not_valid_before.replace(tzinfo=timezone.utc),
-        cert.not_valid_after.replace(tzinfo=timezone.utc),
-    )
-
-
 def verify_and_extract_device_certificate(certificate_pem: bytes) -> dict:
     root = x509.load_pem_x509_certificate(ROOT_CA_PATH.read_bytes())
     cert = x509.load_pem_x509_certificate(certificate_pem)
 
     if cert.issuer != root.subject:
         raise ValueError('certificate issuer does not match configured Root CA')
-    root_public_key = root.public_key()
-    if not isinstance(root_public_key, ec.EllipticCurvePublicKey):
+    if not isinstance(root.public_key(), ec.EllipticCurvePublicKey):
         raise ValueError('Root CA public key is not EC')
-    root_public_key.verify(cert.signature, cert.tbs_certificate_bytes, ec.ECDSA(cert.signature_hash_algorithm))
+    root.public_key().verify(cert.signature, cert.tbs_certificate_bytes, ec.ECDSA(cert.signature_hash_algorithm))
 
     now = datetime.now(timezone.utc)
-    not_before, not_after = _certificate_validity_utc(cert)
+    not_before = cert.not_valid_before_utc
+    not_after = cert.not_valid_after_utc
     if now < not_before or now > not_after:
         raise ValueError('device certificate is outside its validity period')
 
@@ -130,144 +117,112 @@ def verify_and_extract_device_certificate(certificate_pem: bytes) -> dict:
         'certificate_not_after': int(not_after.timestamp()),
         'certificate_subject': cert.subject.rfc4514_string(),
         'certificate_issuer': cert.issuer.rfc4514_string(),
-        'verification': {
-            'root_ca_signature': 'OK',
-            'validity': 'OK',
-            'ca': False,
-            'digital_signature': True,
-            'eku': 'clientAuth',
-            'key': 'P-256',
-            'role': 'device',
-            'identity': device_id,
-        },
     }
-
-
-def init_registry() -> None:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with _lock, sqlite3.connect(DB_PATH) as conn:
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS device_certificates (
-                device_id TEXT PRIMARY KEY,
-                ecosystem TEXT NOT NULL,
-                device_group TEXT NOT NULL,
-                device_model TEXT NOT NULL,
-                product_role TEXT NOT NULL,
-                hardware_revision TEXT NOT NULL,
-                chip_family TEXT NOT NULL,
-                flash_size TEXT NOT NULL,
-                certificate_pem TEXT NOT NULL,
-                certificate_fingerprint TEXT NOT NULL UNIQUE,
-                public_key_der BLOB NOT NULL,
-                public_key_uncompressed BLOB NOT NULL,
-                certificate_not_before INTEGER NOT NULL,
-                certificate_not_after INTEGER NOT NULL,
-                certificate_subject TEXT NOT NULL,
-                certificate_issuer TEXT NOT NULL,
-                last_hello_counter INTEGER NOT NULL DEFAULT 0,
-                registered_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
-            )
-        ''')
-        columns = {row[1] for row in conn.execute('PRAGMA table_info(device_certificates)')}
-        if 'last_hello_counter' not in columns:
-            conn.execute('ALTER TABLE device_certificates ADD COLUMN last_hello_counter INTEGER NOT NULL DEFAULT 0')
 
 
 def register_device_certificate(certificate_pem: bytes) -> dict:
     record = verify_and_extract_device_certificate(certificate_pem)
     now = int(datetime.now(timezone.utc).timestamp())
-    init_registry()
 
-    with _lock, sqlite3.connect(DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row
+    with db_connect() as conn:
         existing = conn.execute(
-            'SELECT certificate_fingerprint FROM device_certificates WHERE device_id=?',
+            'SELECT certificate_fingerprint, registered_at FROM device_certificates WHERE device_id = ?',
             (record['device_id'],),
         ).fetchone()
 
         if existing is None:
-            registration_status = 'REGISTERED'
+            action = 'REGISTERED'
+            registered_at = now
+            conn.execute(
+                '''
+                INSERT INTO device_certificates (
+                    device_id, ecosystem, device_group, device_model, product_role,
+                    hardware_revision, chip_family, flash_size, certificate_pem,
+                    certificate_fingerprint, public_key_der, public_key_uncompressed,
+                    certificate_not_before, certificate_not_after, certificate_subject,
+                    certificate_issuer, last_hello_counter, registered_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+                ''',
+                (
+                    record['device_id'], record['ecosystem'], record['device_group'],
+                    record['device_model'], record['product_role'], record['hardware_revision'],
+                    record['chip_family'], record['flash_size'], record['certificate_pem'],
+                    record['certificate_fingerprint'], record['public_key_der'],
+                    record['public_key_uncompressed'], record['certificate_not_before'],
+                    record['certificate_not_after'], record['certificate_subject'],
+                    record['certificate_issuer'], registered_at, now,
+                ),
+            )
         elif existing['certificate_fingerprint'] == record['certificate_fingerprint']:
-            registration_status = 'UNCHANGED'
+            action = 'UNCHANGED'
+            registered_at = int(existing['registered_at'])
+            conn.execute(
+                'UPDATE device_certificates SET updated_at = ? WHERE device_id = ?',
+                (now, record['device_id']),
+            )
         else:
-            registration_status = 'REPLACED'
+            action = 'REPLACED'
+            registered_at = int(existing['registered_at'])
+            conn.execute(
+                '''
+                UPDATE device_certificates SET
+                    ecosystem=?, device_group=?, device_model=?, product_role=?,
+                    hardware_revision=?, chip_family=?, flash_size=?, certificate_pem=?,
+                    certificate_fingerprint=?, public_key_der=?, public_key_uncompressed=?,
+                    certificate_not_before=?, certificate_not_after=?, certificate_subject=?,
+                    certificate_issuer=?, last_hello_counter=0, updated_at=?
+                WHERE device_id=?
+                ''',
+                (
+                    record['ecosystem'], record['device_group'], record['device_model'],
+                    record['product_role'], record['hardware_revision'], record['chip_family'],
+                    record['flash_size'], record['certificate_pem'], record['certificate_fingerprint'],
+                    record['public_key_der'], record['public_key_uncompressed'],
+                    record['certificate_not_before'], record['certificate_not_after'],
+                    record['certificate_subject'], record['certificate_issuer'], now,
+                    record['device_id'],
+                ),
+            )
 
-        conn.execute('''
-            INSERT INTO device_certificates (
-                device_id, ecosystem, device_group, device_model, product_role,
-                hardware_revision, chip_family, flash_size, certificate_pem,
-                certificate_fingerprint, public_key_der, public_key_uncompressed,
-                certificate_not_before, certificate_not_after, certificate_subject,
-                certificate_issuer, last_hello_counter, registered_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
-            ON CONFLICT(device_id) DO UPDATE SET
-                ecosystem=excluded.ecosystem,
-                device_group=excluded.device_group,
-                device_model=excluded.device_model,
-                product_role=excluded.product_role,
-                hardware_revision=excluded.hardware_revision,
-                chip_family=excluded.chip_family,
-                flash_size=excluded.flash_size,
-                certificate_pem=excluded.certificate_pem,
-                certificate_fingerprint=excluded.certificate_fingerprint,
-                public_key_der=excluded.public_key_der,
-                public_key_uncompressed=excluded.public_key_uncompressed,
-                certificate_not_before=excluded.certificate_not_before,
-                certificate_not_after=excluded.certificate_not_after,
-                certificate_subject=excluded.certificate_subject,
-                certificate_issuer=excluded.certificate_issuer,
-                last_hello_counter=CASE
-                    WHEN device_certificates.certificate_fingerprint = excluded.certificate_fingerprint
-                    THEN device_certificates.last_hello_counter
-                    ELSE 0
-                END,
-                updated_at=excluded.updated_at
-        ''', (
-            record['device_id'], record['ecosystem'], record['device_group'],
-            record['device_model'], record['product_role'], record['hardware_revision'],
-            record['chip_family'], record['flash_size'], record['certificate_pem'],
-            record['certificate_fingerprint'], record['public_key_der'],
-            record['public_key_uncompressed'], record['certificate_not_before'],
-            record['certificate_not_after'], record['certificate_subject'],
-            record['certificate_issuer'], now, now,
-        ))
-
-    record['registration_status'] = registration_status
+    record['registration_action'] = action
+    record['registered_at'] = registered_at
+    record['updated_at'] = now
     return record
 
 
 def get_registered_device(device_id: str) -> dict | None:
     normalized = normalize_device_id(device_id)
-    init_registry()
-    with _lock, sqlite3.connect(DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row
-        row = conn.execute('SELECT * FROM device_certificates WHERE device_id=?', (normalized,)).fetchone()
+    with db_connect() as conn:
+        row = conn.execute(
+            'SELECT * FROM device_certificates WHERE device_id=?',
+            (normalized,),
+        ).fetchone()
     return dict(row) if row else None
 
 
 def list_registered_devices() -> list[dict]:
-    init_registry()
-    with _lock, sqlite3.connect(DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute('''
-            SELECT
-                device_id, ecosystem, device_group, device_model, product_role,
-                hardware_revision, chip_family, flash_size,
-                certificate_fingerprint, certificate_not_before, certificate_not_after,
-                last_hello_counter, registered_at, updated_at
+    with db_connect() as conn:
+        rows = conn.execute(
+            '''
+            SELECT device_id, ecosystem, device_group, device_model, product_role,
+                   hardware_revision, chip_family, flash_size, certificate_fingerprint,
+                   certificate_not_before, certificate_not_after, last_hello_counter,
+                   registered_at, updated_at
             FROM device_certificates
             ORDER BY device_id
-        ''').fetchall()
+            '''
+        ).fetchall()
     return [dict(row) for row in rows]
 
 
 def accept_hello_counter(device_id: str, counter: int) -> bool:
     normalized = normalize_device_id(device_id)
-    init_registry()
-    with _lock, sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute('SELECT last_hello_counter FROM device_certificates WHERE device_id=?', (normalized,)).fetchone()
-        if row is None or counter <= int(row[0]):
+    with db_connect() as conn:
+        row = conn.execute(
+            'SELECT last_hello_counter FROM device_certificates WHERE device_id=?',
+            (normalized,),
+        ).fetchone()
+        if row is None or counter <= int(row['last_hello_counter']):
             return False
         conn.execute(
             'UPDATE device_certificates SET last_hello_counter=?, updated_at=? WHERE device_id=?',
