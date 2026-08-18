@@ -10,6 +10,7 @@ ls -la /share/ota_server/firmware
 echo "esptool:"
 esptool version
 
+python3 /manufacturing_api.py &
 python3 /mqtt_listener.py &
 
 exec python3 /server.py
