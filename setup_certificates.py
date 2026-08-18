@@ -21,7 +21,7 @@ OTA_CERT_NAME = 'ota_server_cert.pem'
 OTA_KEY_NAME = 'ota_server_private.pem'
 OTA_PUBLIC_NAME = 'ota_server_public.pem'
 REMOTE_CERT_DIR = '/share/ota_server/cert'
-ROLE_URI = 'urn:esp-pki:role:ota-server'
+ROLE_URI = 'urn:jarzem:esp:pki:role:ota-server'
 
 
 def ask(prompt: str, default: str | None = None) -> str:
