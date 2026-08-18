@@ -9,7 +9,8 @@ from urllib.parse import urlparse
 from cryptography import x509
 from cryptography.hazmat.primitives import serialization
 
-from device_registry import init_registry, list_registered_devices, register_device_certificate
+from database import assert_schema_current, database_summary
+from device_registry import list_registered_devices, register_device_certificate
 
 PORT = 8451
 CERT_DIR = Path('/share/ota_server/cert')
@@ -28,7 +29,7 @@ def public_key_pem_from_certificate(cert_path: Path) -> bytes:
 
 
 class ManufacturingHandler(http.server.BaseHTTPRequestHandler):
-    server_version = 'OTA-Manufacturing/3'
+    server_version = 'OTA-Manufacturing/4'
 
     def log_message(self, fmt, *args):
         print(f'MANUFACTURING {self.address_string()} - {fmt % args}', flush=True)
@@ -53,14 +54,10 @@ class ManufacturingHandler(http.server.BaseHTTPRequestHandler):
         if path == '/api/manufacturing/ota-public.pem':
             return self.send_bytes(200, public_key_pem_from_certificate(OTA_CERT_PATH), 'application/x-pem-file')
         if path == '/api/manufacturing/health':
-            return self.send_json(200, {'status': 'OK'})
+            return self.send_json(200, {'status': 'OK', 'database': 'mysql'})
         if path == '/api/manufacturing/devices':
             devices = list_registered_devices()
-            return self.send_json(200, {
-                'status': 'OK',
-                'count': len(devices),
-                'devices': devices,
-            })
+            return self.send_json(200, {'status': 'OK', 'count': len(devices), 'devices': devices})
         self.send_error(404, 'Not found')
 
     def do_POST(self):
@@ -86,20 +83,16 @@ class ManufacturingHandler(http.server.BaseHTTPRequestHandler):
             self.send_json(400, {'status': 'ERROR', 'error': str(exc)})
             return
 
-        verification = record['verification']
         print(
             'MANUFACTURING certificate verification OK '
-            f"device_id={record['device_id']} "
-            f"root_ca_signature={verification['root_ca_signature']} "
-            f"validity={verification['validity']} ca={verification['ca']} "
-            f"digital_signature={verification['digital_signature']} "
-            f"eku={verification['eku']} key={verification['key']} "
-            f"role={verification['role']} identity={verification['identity']} "
-            f"cert_sha256={record['certificate_fingerprint']}",
+            f"device_id={record['device_id']} root_ca_signature=OK validity=OK "
+            f"ca=FALSE digital_signature=OK eku=clientAuth key=P-256 role=device "
+            f"identity=OK cert_sha256={record['certificate_fingerprint']}",
             flush=True,
         )
+        action = record['registration_action']
         print(
-            f"MANUFACTURING device {record['registration_status']} "
+            f'MANUFACTURING device {action} '
             f"device_id={record['device_id']} ecosystem={record['ecosystem']} "
             f"group={record['device_group']} model={record['device_model']} "
             f"role={record['product_role']} hw={record['hardware_revision']} "
@@ -107,7 +100,7 @@ class ManufacturingHandler(http.server.BaseHTTPRequestHandler):
             flush=True,
         )
         self.send_json(200, {
-            'status': record['registration_status'],
+            'status': action,
             'device_id': record['device_id'],
             'certificate_fingerprint': record['certificate_fingerprint'],
             'device_group': record['device_group'],
@@ -125,7 +118,9 @@ def main() -> None:
         if not path.is_file():
             raise RuntimeError(f'missing manufacturing credential: {path}')
 
-    init_registry()
+    assert_schema_current()
+    print(f'Manufacturing database ready: {database_summary()}', flush=True)
+
     server = http.server.ThreadingHTTPServer(('0.0.0.0', PORT), ManufacturingHandler)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(str(OTA_CERT_PATH), str(OTA_KEY_PATH))
