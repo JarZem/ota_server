@@ -45,15 +45,30 @@ At add-on startup `run.sh` executes:
 alembic -c /alembic.ini upgrade head
 ```
 
-Only after Alembic completes are `manufacturing_api.py`, `mqtt_listener.py` and the OTA server started.
-
-The Alembic version table is deliberately namespaced:
+Only after Alembic completes are application services started. The Alembic version table is deliberately namespaced:
 
 ```text
 ota_server_alembic_version
 ```
 
 This avoids collisions with another application using Alembic in the shared `homeassistant` database.
+
+## One-time migration from SQLite
+
+Immediately after the first successful Alembic migration, `migrate_legacy_sqlite.py` looks for the previous runtime databases:
+
+```text
+/data/ota_server.db
+/data/device_registry.db
+```
+
+If found, their existing rows are copied into the corresponding MySQL tables. Only after a successful import is each legacy database renamed to:
+
+```text
+*.db.migrated
+```
+
+On subsequent starts there is therefore no active SQLite database to read or write.
 
 ## Table names
 
@@ -76,6 +91,7 @@ Application code accesses them through `database.py`; logical legacy names are t
 
 - `migrations/`: database structure and future schema changes.
 - `database.py`: MySQL configuration, SQLAlchemy engine, transactions and runtime SQL adaptation.
+- `migrate_legacy_sqlite.py`: one-time legacy data import only.
 - `device_registry.py`: device certificate SELECT/INSERT/UPDATE only.
 - `manufacturing_api.py`: HTTP API only; never creates tables.
 - `server_mysql.py`: activates the MySQL database layer for the existing OTA application.
