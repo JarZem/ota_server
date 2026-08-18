@@ -36,8 +36,9 @@ TEST_PRODUCT_ROLE = 'integration-test'
 TEST_HARDWARE = 'TEST-REV'
 TEST_CHIP = 'ESP32-C6'
 TEST_FLASH = '16MB'
-ROLE_DEVICE_URI = 'urn:esp-pki:role:device'
-ROLE_OTA_URI = 'urn:esp-pki:role:ota-server'
+PKI_URI_PREFIX = 'urn:jarzem:esp:pki:'
+ROLE_DEVICE_URI = PKI_URI_PREFIX + 'role:device'
+ROLE_OTA_URI = PKI_URI_PREFIX + 'role:ota-server'
 
 
 def fail(message: str) -> None:
@@ -121,13 +122,13 @@ def build_device_cert(ca_cert: x509.Certificate,
     ])
     uris = [
         role_uri,
-        f'urn:esp-pki:device:{TEST_DEVICE_COMPACT}',
-        f'urn:esp-pki:group:{TEST_GROUP}',
-        f'urn:esp-pki:model:{TEST_MODEL}',
-        f'urn:esp-pki:product-role:{TEST_PRODUCT_ROLE}',
-        f'urn:esp-pki:hardware:{TEST_HARDWARE}',
-        f'urn:esp-pki:chip:{TEST_CHIP}',
-        f'urn:esp-pki:flash:{TEST_FLASH}',
+        f'{PKI_URI_PREFIX}device:{TEST_DEVICE_COMPACT}',
+        f'{PKI_URI_PREFIX}group:{TEST_GROUP}',
+        f'{PKI_URI_PREFIX}model:{TEST_MODEL}',
+        f'{PKI_URI_PREFIX}product-role:{TEST_PRODUCT_ROLE}',
+        f'{PKI_URI_PREFIX}hardware:{TEST_HARDWARE}',
+        f'{PKI_URI_PREFIX}chip:{TEST_CHIP}',
+        f'{PKI_URI_PREFIX}flash:{TEST_FLASH}',
     ]
     eku = [ExtendedKeyUsageOID.CLIENT_AUTH] if client_auth else [ExtendedKeyUsageOID.SERVER_AUTH]
     return (
@@ -186,7 +187,7 @@ def build_self_signed_invalid_cert(ecosystem: str) -> x509.Certificate:
         .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.CLIENT_AUTH]), critical=False)
         .add_extension(x509.SubjectAlternativeName([
             x509.UniformResourceIdentifier(ROLE_DEVICE_URI),
-            x509.UniformResourceIdentifier(f'urn:esp-pki:device:{TEST_DEVICE_COMPACT}'),
+            x509.UniformResourceIdentifier(f'{PKI_URI_PREFIX}device:{TEST_DEVICE_COMPACT}'),
         ]), critical=False)
         .sign(key, hashes.SHA256())
     )
@@ -221,8 +222,8 @@ def main() -> None:
     if ExtendedKeyUsageOID.SERVER_AUTH not in eku:
         fail('OTA certificate does not contain serverAuth EKU')
     if ROLE_OTA_URI not in san_uri_values(ota_cert):
-        fail('OTA certificate does not contain ota-server role URI')
-    print('PASS OTA server certificate chain, EKU and role')
+        fail(f'OTA certificate does not contain expected role URI {ROLE_OTA_URI}')
+    print('PASS OTA server certificate chain, EKU and existing JarZem role URI')
 
     ota_public_endpoint = serialization.load_pem_public_key(
         get_bytes(base, '/api/manufacturing/ota-public.pem', root_ca_path)
@@ -268,7 +269,7 @@ def main() -> None:
         fail(f'untrusted certificate was not rejected HTTP={status3} response={response3}')
     print('PASS self-signed/untrusted device certificate rejected')
 
-    wrong_role = build_device_cert(ca_cert, ca_key, args.ecosystem, role_uri='urn:esp-pki:role:ota-server')
+    wrong_role = build_device_cert(ca_cert, ca_key, args.ecosystem, role_uri=ROLE_OTA_URI)
     status4, response4 = post_certificate(base, root_ca_path, wrong_role.public_bytes(serialization.Encoding.PEM))
     if status4 != 400 or response4.get('status') != 'ERROR':
         fail(f'wrong-role certificate was not rejected HTTP={status4} response={response4}')
