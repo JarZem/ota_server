@@ -6,20 +6,19 @@ import ssl
 import time
 import urllib.request
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 
 import paho.mqtt.client as mqtt
-from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
+from cryptography.hazmat.primitives.asymmetric import ec
+
+from device_registry import accept_hello_counter, get_registered_device, normalize_device_id
 
 OPTIONS_PATH = "/data/options.json"
-ROOT_CA_CERT_PATH = "/share/ota_server/cert/root_ca_cert.pem"
 SUPERVISOR_TOKEN = os.environ.get("SUPERVISOR_TOKEN", "")
-DEVICE_ID_RE = re.compile(r"^[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){7}$")
+COMPACT_ID_RE = re.compile(r"^[0-9a-fA-F]{16}$")
 TX_RE = re.compile(r"^[0-9a-fA-F]{8}$")
+NONCE_RE = re.compile(r"^[0-9a-fA-F]{8}$")
 SESSION_TTL = 30
-HELLO_FIELD_COUNT = 12
 
 
 @dataclass
@@ -27,12 +26,13 @@ class HelloSession:
     topic_device: str
     protocol: int
     tx: str
-    data_total: int
-    cert_total: int
+    compact_device_id: str
+    device_id: str
+    counter: int
+    nonce: str
     sig_total: int
+    canonical: str
     created_at: float = field(default_factory=time.time)
-    data_parts: dict = field(default_factory=dict)
-    cert_parts: dict = field(default_factory=dict)
     sig_parts: dict = field(default_factory=dict)
 
 
@@ -63,45 +63,15 @@ def get_mqtt_service():
     }
 
 
-def topic_device_to_id(topic_device):
+def topic_device_to_compact(topic_device):
     value = topic_device.lower()
     if value.startswith("0x"):
         value = value[2:]
-    if not re.fullmatch(r"[0-9a-f]{16}", value):
-        return None
-    return ":".join(value[i:i + 2] for i in range(0, 16, 2))
+    return value if COMPACT_ID_RE.fullmatch(value) else None
 
 
 def b64url_decode(value):
-    padding_len = (-len(value)) % 4
-    return base64.urlsafe_b64decode(value + ("=" * padding_len))
-
-
-def fingerprint_hex(cert):
-    return cert.fingerprint(hashes.SHA256()).hex()
-
-
-def load_root_ca():
-    with open(ROOT_CA_CERT_PATH, "rb") as f:
-        return x509.load_pem_x509_certificate(f.read())
-
-
-def verify_certificate_with_root(cert, root):
-    now = datetime.now(timezone.utc)
-    not_before = getattr(cert, "not_valid_before_utc", cert.not_valid_before.replace(tzinfo=timezone.utc))
-    not_after = getattr(cert, "not_valid_after_utc", cert.not_valid_after.replace(tzinfo=timezone.utc))
-    if now < not_before or now > not_after:
-        raise ValueError("device certificate is outside its validity period")
-    if cert.issuer != root.subject:
-        raise ValueError("device certificate issuer does not match configured Root CA")
-
-    root_key = root.public_key()
-    if isinstance(root_key, ec.EllipticCurvePublicKey):
-        root_key.verify(cert.signature, cert.tbs_certificate_bytes, ec.ECDSA(cert.signature_hash_algorithm))
-    elif isinstance(root_key, rsa.RSAPublicKey):
-        root_key.verify(cert.signature, cert.tbs_certificate_bytes, padding.PKCS1v15(), cert.signature_hash_algorithm)
-    else:
-        raise ValueError("unsupported Root CA public key type")
+    return base64.urlsafe_b64decode(value + ("=" * ((-len(value)) % 4)))
 
 
 def request_challenge(device_id, ota_port):
@@ -121,127 +91,92 @@ def purge_sessions():
     now = time.time()
     for key in list(sessions):
         if now - sessions[key].created_at > SESSION_TTL:
-            print(f"HELLO session expired tx={sessions[key].tx} device={sessions[key].topic_device}", flush=True)
+            print(f"HELLO session expired tx={sessions[key].tx} device={sessions[key].device_id}", flush=True)
             del sessions[key]
 
 
-def parse_start(parts, topic_device):
-    if len(parts) != 6:
-        raise ValueError("H0 must contain exactly 6 fields")
-    protocol = int(parts[1])
-    tx = parts[2]
-    data_total = int(parts[3])
-    cert_total = int(parts[4])
-    sig_total = int(parts[5])
-    if protocol != 1 or not TX_RE.fullmatch(tx):
-        raise ValueError("invalid HELLO protocol or transaction id")
-    if not (1 <= data_total <= 32 and 1 <= cert_total <= 64 and 1 <= sig_total <= 8):
-        raise ValueError("invalid HELLO fragment counts")
-    return HelloSession(topic_device, protocol, tx, data_total, cert_total, sig_total)
+def parse_start(parts, topic_device, expected_ecosystem):
+    if len(parts) != 7:
+        raise ValueError("HELLO H must contain exactly 7 fields")
+    _, protocol_text, tx, compact_id, counter_text, nonce, sig_total_text = parts
+    protocol = int(protocol_text)
+    if protocol != 1:
+        raise ValueError("unsupported HELLO protocol")
+    if not TX_RE.fullmatch(tx) or not COMPACT_ID_RE.fullmatch(compact_id) or not NONCE_RE.fullmatch(nonce):
+        raise ValueError("invalid HELLO transaction/device/nonce field")
+    counter = int(counter_text)
+    sig_total = int(sig_total_text)
+    if counter <= 0 or not (1 <= sig_total <= 4):
+        raise ValueError("invalid HELLO counter or signature fragment count")
+    topic_compact = topic_device_to_compact(topic_device)
+    if topic_compact != compact_id.lower():
+        raise ValueError(f"topic/device mismatch topic={topic_compact} hello={compact_id}")
+
+    device_id = normalize_device_id(compact_id)
+    registered = get_registered_device(device_id)
+    if registered is None:
+        raise ValueError("device certificate is not registered in OTA")
+    if registered["ecosystem"] != expected_ecosystem:
+        raise ValueError(
+            f"registered ecosystem mismatch received={registered['ecosystem']} expected={expected_ecosystem}"
+        )
+    now = int(time.time())
+    if now < int(registered["certificate_not_before"]) or now > int(registered["certificate_not_after"]):
+        raise ValueError("registered device certificate is outside its validity period")
+
+    canonical = f"{protocol}|{compact_id.lower()}|{counter}|{nonce.lower()}|{tx.lower()}"
+    return HelloSession(topic_device, protocol, tx.lower(), compact_id.lower(), device_id,
+                        counter, nonce.lower(), sig_total, canonical)
 
 
-def accept_fragment(session, parts):
-    if len(parts) != 5:
-        raise ValueError("HELLO fragment must contain exactly 5 fields")
-    kind, tx, index_text, total_text, data = parts
-    if tx != session.tx:
-        raise ValueError("fragment transaction mismatch")
+def accept_signature_fragment(session, parts):
+    if len(parts) != 5 or parts[0] != "S":
+        raise ValueError("signature fragment must contain exactly 5 fields")
+    _, tx, index_text, total_text, data = parts
+    if tx.lower() != session.tx:
+        raise ValueError("signature fragment transaction mismatch")
     index = int(index_text)
     total = int(total_text)
-    target = {
-        "HD": (session.data_parts, session.data_total),
-        "HC": (session.cert_parts, session.cert_total),
-        "HS": (session.sig_parts, session.sig_total),
-    }.get(kind)
-    if target is None:
-        raise ValueError("unknown HELLO fragment type")
-    store, expected_total = target
-    if total != expected_total or index < 0 or index >= total:
-        raise ValueError("invalid HELLO fragment index/total")
-    store[index] = data
+    if total != session.sig_total or index < 0 or index >= total:
+        raise ValueError("invalid signature fragment index/total")
+    session.sig_parts[index] = data
 
 
-def series_complete(parts, total):
-    return len(parts) == total and all(i in parts for i in range(total))
+def signature_complete(session):
+    return len(session.sig_parts) == session.sig_total and all(i in session.sig_parts for i in range(session.sig_total))
 
 
-def join_series(parts, total):
-    return "".join(parts[i] for i in range(total))
-
-
-def verify_complete_hello(session, expected_ecosystem):
-    canonical = join_series(session.data_parts, session.data_total)
-    cert_b64 = join_series(session.cert_parts, session.cert_total)
-    signature_b64 = join_series(session.sig_parts, session.sig_total)
-
-    fields = canonical.split("|")
-    if len(fields) != HELLO_FIELD_COUNT:
-        raise ValueError(f"canonical HELLO field count={len(fields)} expected={HELLO_FIELD_COUNT}")
-
-    protocol, device_id, ecosystem, device_model, product_role, hardware_revision, chip_family, flash_size, firmware_version, firmware_channel, key_id, public_key_b64 = fields
-    if int(protocol) != session.protocol:
-        raise ValueError("canonical protocol mismatch")
-    if not DEVICE_ID_RE.fullmatch(device_id):
-        raise ValueError("invalid canonical device_id")
-    topic_device_id = topic_device_to_id(session.topic_device)
-    if topic_device_id != device_id.lower():
-        raise ValueError(f"topic/device mismatch topic={topic_device_id} hello={device_id}")
-    if ecosystem != expected_ecosystem:
-        raise ValueError(f"ecosystem mismatch received={ecosystem} expected={expected_ecosystem}")
-
-    cert_der = b64url_decode(cert_b64)
-    cert = x509.load_der_x509_certificate(cert_der)
-    root = load_root_ca()
-
-    print(
-        f"HELLO certificate assembled device_id={device_id} tx={session.tx} "
-        f"chunks={session.cert_total} der_bytes={len(cert_der)}",
-        flush=True,
-    )
-    print(
-        f"HELLO certificate subject={cert.subject.rfc4514_string()} issuer={cert.issuer.rfc4514_string()}",
-        flush=True,
-    )
-    print(f"HELLO certificate fingerprint_sha256={fingerprint_hex(cert)}", flush=True)
-
-    verify_certificate_with_root(cert, root)
-    print(f"HELLO certificate CA verification: OK device_id={device_id}", flush=True)
-
-    sent_public_key_der = b64url_decode(public_key_b64)
-    cert_public_key_der = cert.public_key().public_bytes(
-        serialization.Encoding.DER,
-        serialization.PublicFormat.SubjectPublicKeyInfo,
-    )
-    if sent_public_key_der != cert_public_key_der:
-        raise ValueError("HELLO public key does not match certificate")
-    print(f"HELLO certificate/public-key binding: OK key_id={key_id}", flush=True)
-
+def verify_signed_hello(session):
+    registered = get_registered_device(session.device_id)
+    if registered is None:
+        raise ValueError("registered certificate disappeared")
+    signature_b64 = "".join(session.sig_parts[i] for i in range(session.sig_total))
     signature_der = b64url_decode(signature_b64)
-    cert_key = cert.public_key()
-    if not isinstance(cert_key, ec.EllipticCurvePublicKey):
-        raise ValueError("device certificate public key is not EC")
-    cert_key.verify(signature_der, canonical.encode("utf-8"), ec.ECDSA(hashes.SHA256()))
-    print(f"HELLO ECDSA signature verification: OK device_id={device_id} tx={session.tx}", flush=True)
+    public_key = serialization.load_der_public_key(registered["public_key_der"])
+    if not isinstance(public_key, ec.EllipticCurvePublicKey):
+        raise ValueError("registered device public key is not EC")
+    public_key.verify(signature_der, session.canonical.encode("utf-8"), ec.ECDSA(hashes.SHA256()))
 
-    metadata = {
-        "device_id": device_id.lower(),
-        "ecosystem": ecosystem,
-        "device_model": device_model,
-        "product_role": product_role,
-        "hardware_revision": hardware_revision,
-        "chip_family": chip_family,
-        "flash_size": flash_size,
-        "firmware_version": firmware_version,
-        "firmware_channel": firmware_channel,
-        "key_id": int(key_id),
-        "certificate_fingerprint": fingerprint_hex(cert),
-    }
+    if not accept_hello_counter(session.device_id, session.counter):
+        raise ValueError("HELLO counter replay or rollback")
+
     print(
-        "HELLO identity verified: "
-        + " ".join(f"{k}={v}" for k, v in metadata.items()),
+        f"HELLO certificate registry: OK device_id={session.device_id} "
+        f"cert_sha256={registered['certificate_fingerprint']} subject={registered['certificate_subject']}",
         flush=True,
     )
-    return metadata
+    print(
+        f"HELLO identity from certificate: ecosystem={registered['ecosystem']} "
+        f"group={registered['device_group']} model={registered['device_model']} "
+        f"role={registered['product_role']} hw={registered['hardware_revision']} "
+        f"chip={registered['chip_family']} flash={registered['flash_size']}",
+        flush=True,
+    )
+    print(
+        f"HELLO ECDSA signature verification: OK device_id={session.device_id} "
+        f"tx={session.tx} counter={session.counter} nonce={session.nonce}",
+        flush=True,
+    )
 
 
 def build_client(base_topic, ota_port, expected_ecosystem):
@@ -258,7 +193,7 @@ def build_client(base_topic, ota_port, expected_ecosystem):
         topic = f"{base_topic}/+/action"
         client.subscribe(topic, qos=0)
         print(f"MQTT enrollment listener subscribed: {topic}", flush=True)
-        print(f"MQTT enrollment Root CA: {ROOT_CA_CERT_PATH}", flush=True)
+        print("MQTT enrollment uses OTA device certificate registry; certificates are not transported over Zigbee", flush=True)
 
     def on_message(client, userdata, message):
         purge_sessions()
@@ -276,53 +211,47 @@ def build_client(base_topic, ota_port, expected_ecosystem):
         kind = parts[0] if parts else ""
 
         try:
-            if kind == "H0":
-                session = parse_start(parts, topic_device)
+            if kind == "H":
+                session = parse_start(parts, topic_device, expected_ecosystem)
                 sessions[(topic_device, session.tx)] = session
                 print(
-                    f"HELLO start received device_topic={topic_device} tx={session.tx} "
-                    f"parts=data:{session.data_total} cert:{session.cert_total} sig:{session.sig_total}",
+                    f"HELLO start received device_id={session.device_id} tx={session.tx} "
+                    f"counter={session.counter} nonce={session.nonce} sig_parts={session.sig_total}",
                     flush=True,
                 )
                 return
 
-            if kind not in ("HD", "HC", "HS") or len(parts) < 2:
+            if kind != "S" or len(parts) < 2:
                 return
-            key = (topic_device, parts[1])
+            key = (topic_device, parts[1].lower())
             session = sessions.get(key)
             if session is None:
-                print(f"HELLO fragment ignored: no session device={topic_device} tx={parts[1]}", flush=True)
+                print(f"HELLO signature fragment ignored: no session device={topic_device} tx={parts[1]}", flush=True)
                 return
 
-            accept_fragment(session, parts)
+            accept_signature_fragment(session, parts)
             print(
-                f"HELLO fragment received type={kind} tx={session.tx} "
-                f"progress=data:{len(session.data_parts)}/{session.data_total} "
-                f"cert:{len(session.cert_parts)}/{session.cert_total} "
-                f"sig:{len(session.sig_parts)}/{session.sig_total}",
+                f"HELLO signature fragment received tx={session.tx} "
+                f"progress={len(session.sig_parts)}/{session.sig_total}",
                 flush=True,
             )
-
-            if not (series_complete(session.data_parts, session.data_total) and
-                    series_complete(session.cert_parts, session.cert_total) and
-                    series_complete(session.sig_parts, session.sig_total)):
+            if not signature_complete(session):
                 return
 
-            metadata = verify_complete_hello(session, expected_ecosystem)
+            verify_signed_hello(session)
             del sessions[key]
         except Exception as e:
             print(f"HELLO rejected device_topic={topic_device}: {e}", flush=True)
             if len(parts) > 1:
-                sessions.pop((topic_device, parts[1]), None)
+                sessions.pop((topic_device, parts[1].lower()), None)
             return
 
-        device_id = metadata["device_id"]
         try:
-            challenge = request_challenge(device_id, ota_port)
+            challenge = request_challenge(session.device_id, ota_port)
             message_id = str(challenge["message_id"])
             challenge_hex = str(challenge["challenge"])
         except Exception as e:
-            print(f"MQTT enrollment challenge creation failed device_id={device_id}: {e}", flush=True)
+            print(f"MQTT enrollment challenge creation failed device_id={session.device_id}: {e}", flush=True)
             return
 
         command = f"A|{message_id}|{challenge_hex}"
@@ -330,8 +259,8 @@ def build_client(base_topic, ota_port, expected_ecosystem):
         body = json.dumps({"ota_command": command}, separators=(",", ":"))
         result = client.publish(topic, body, qos=0, retain=False)
         print(
-            f"DEVICE_AUTH_CHALLENGE sent only after verified HELLO device_id={device_id} "
-            f"message_id={message_id} topic={topic} rc={result.rc}",
+            f"DEVICE_AUTH_CHALLENGE sent only after registered-cert HELLO verification "
+            f"device_id={session.device_id} message_id={message_id} topic={topic} rc={result.rc}",
             flush=True,
         )
 
@@ -345,16 +274,6 @@ def main():
     base_topic = str(options.get("mqtt_base_topic") or "zigbee2mqtt").strip()
     ota_port = int(options.get("ota_port") or 8443)
     expected_ecosystem = str(options.get("ota_ecosystem") or "JaroslavZemanESP").strip()
-
-    try:
-        root = load_root_ca()
-        print(
-            f"MQTT enrollment Root CA loaded subject={root.subject.rfc4514_string()} "
-            f"fingerprint_sha256={fingerprint_hex(root)}",
-            flush=True,
-        )
-    except Exception as e:
-        raise RuntimeError(f"Root CA required for device HELLO verification: {e}") from e
 
     while True:
         try:
