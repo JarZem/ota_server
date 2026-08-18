@@ -13,7 +13,7 @@ from cryptography.x509.oid import ExtendedKeyUsageOID, ExtensionOID, NameOID
 
 DB_PATH = Path('/data/device_registry.db')
 ROOT_CA_PATH = Path('/share/ota_server/cert/root_ca_cert.pem')
-URI_PREFIX = 'urn:esp-pki:'
+URI_PREFIX = 'urn:jarzem:esp:pki:'
 _lock = threading.Lock()
 
 
