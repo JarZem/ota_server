@@ -16,6 +16,8 @@ alembic -c /alembic.ini upgrade head
 
 echo "Database schema ready"
 
+python3 /migrate_legacy_sqlite.py
+
 python3 /manufacturing_api.py &
 python3 /mqtt_listener.py &
 
