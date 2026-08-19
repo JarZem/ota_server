@@ -216,16 +216,24 @@ def list_registered_devices() -> list[dict]:
 
 
 def accept_hello_counter(device_id: str, counter: int) -> bool:
+    """Atomically accept any strictly newer counter.
+
+    Gaps are intentionally allowed. A lost HELLO, reboot after NVS increment, or
+    network reordering therefore cannot brick enrollment. A late lower/equal
+    counter is simply stale/replay and is ignored.
+    """
     normalized = normalize_device_id(device_id)
+    if counter <= 0:
+        return False
+
+    now = int(datetime.now(timezone.utc).timestamp())
     with db_connect() as conn:
-        row = conn.execute(
-            'SELECT last_hello_counter FROM device_certificates WHERE device_id=?',
-            (normalized,),
-        ).fetchone()
-        if row is None or counter <= int(row['last_hello_counter']):
-            return False
-        conn.execute(
-            'UPDATE device_certificates SET last_hello_counter=?, updated_at=? WHERE device_id=?',
-            (counter, int(datetime.now(timezone.utc).timestamp()), normalized),
+        result = conn.execute(
+            '''
+            UPDATE device_certificates
+            SET last_hello_counter=?, updated_at=?
+            WHERE device_id=? AND last_hello_counter < ?
+            ''',
+            (counter, now, normalized, counter),
         )
-    return True
+        return result.rowcount == 1
