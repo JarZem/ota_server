@@ -20,11 +20,50 @@ COMPACT_ID_RE = re.compile(r"^[0-9a-fA-F]{16}$")
 MESSAGE_ID_RE = re.compile(r"^[0-9a-fA-F]{16}$")
 MAX_COUNTER = (1 << 63) - 1
 
+# ANSI colors are supported by the Home Assistant add-on log viewer.
+RESET = "\033[0m"
+BOLD = "\033[1m"
+CYAN = "\033[36m"      # Zigbee/MQTT transport
+GREEN = "\033[32m"     # successful verification / accepted
+YELLOW = "\033[33m"    # internal OTA processing
+MAGENTA = "\033[35m"   # HTTPS/internal service calls
+RED = "\033[31m"       # errors
+BLUE = "\033[34m"      # outgoing transport
+
+
+def _log(prefix, color, text):
+    print(f"{color}{BOLD}[{prefix}]{RESET} {text}", flush=True)
+
+
+def log_zigbee(text):
+    _log("ZIGBEE/MQTT", CYAN, text)
+
+
+def log_internal(text):
+    _log("OTA/INTERNAL", YELLOW, text)
+
+
+def log_verify(text):
+    _log("OTA/VERIFY", GREEN, text)
+
+
+def log_https(text):
+    _log("OTA/HTTPS", MAGENTA, text)
+
+
+def log_tx(text):
+    _log("ZIGBEE/TX", BLUE, text)
+
+
+def log_error(text):
+    _log("OTA/ERROR", RED, text)
+
+
 # Application transport policy above MQTT/Zigbee:
 # - only one outstanding challenge per device
 # - no blind flooding when HELLO repeats
-# - broker publish success is NOT considered device delivery
-# - delivery is complete only after R|<message_id>|OK comes back from ESP
+# - MQTT broker acceptance is confirmed with QoS 1
+# - end-to-end delivery is complete only after R|<message_id>|OK comes back from ESP
 CHALLENGE_RETRY_SECONDS = 15
 CHALLENGE_MAX_ATTEMPTS = 3
 CHALLENGE_PENDING_TTL_SECONDS = 90
@@ -69,6 +108,7 @@ def b64url_decode(value):
 
 
 def request_challenge(device_id, ota_port):
+    log_internal(f"building challenge request device_id={device_id}")
     body = json.dumps({"device_id": device_id}).encode("utf-8")
     req = urllib.request.Request(
         f"https://127.0.0.1:{ota_port}/api/device/challenge",
@@ -77,8 +117,11 @@ def request_challenge(device_id, ota_port):
         method="POST",
     )
     ctx = ssl._create_unverified_context()
+    log_https("internal challenge API call -> local OTA service /api/device/challenge")
     with urllib.request.urlopen(req, timeout=10, context=ctx) as response:
-        return json.loads(response.read().decode("utf-8"))
+        result = json.loads(response.read().decode("utf-8"))
+    log_https("internal challenge API call <- HTTP 200")
+    return result
 
 
 def verify_single_hello(payload, topic_device, expected_ecosystem):
@@ -124,31 +167,38 @@ def verify_single_hello(payload, topic_device, expected_ecosystem):
     public_key.verify(signature_der, canonical, ec.ECDSA(hashes.SHA256()))
 
     if not accept_hello_counter(device_id, counter):
-        return {
-            "status": "STALE",
-            "device_id": device_id,
-            "counter": counter,
-            "registered": registered,
-        }
+        return {"status": "STALE", "device_id": device_id, "counter": counter, "registered": registered}
 
-    return {
-        "status": "ACCEPTED",
-        "device_id": device_id,
-        "counter": counter,
-        "registered": registered,
-    }
+    return {"status": "ACCEPTED", "device_id": device_id, "counter": counter, "registered": registered}
 
 
 def publish_pending_challenge(client, base_topic, item, reason):
     command = f"A|{item['message_id']}|{item['challenge']}"
     topic = f"{base_topic}/{item['topic_device']}/set"
     body = json.dumps({"ota_command": command}, separators=(",", ":"))
-    result = client.publish(topic, body, qos=0, retain=False)
-    print(
-        f"CHALLENGE MQTT publish reason={reason} device_id={item['device_id']} "
-        f"message_id={item['message_id']} attempt={item['attempts']}/{CHALLENGE_MAX_ATTEMPTS} "
-        f"bytes={len(command)} topic={topic} broker_rc={result.rc}; waiting for ESP application ACK",
-        flush=True,
+
+    log_internal(
+        f"challenge assembled device_id={item['device_id']} message_id={item['message_id']} "
+        f"bytes={len(command)} attempt={item['attempts']}/{CHALLENGE_MAX_ATTEMPTS}"
+    )
+    log_tx(f"MQTT publish -> topic={topic} payload=ota_command:A|{item['message_id']}|<64-hex> qos=1 reason={reason}")
+
+    result = client.publish(topic, body, qos=1, retain=False)
+    if result.rc != mqtt.MQTT_ERR_SUCCESS:
+        raise RuntimeError(f"MQTT publish rejected immediately rc={result.rc}")
+
+    # QoS 1: wait until the broker acknowledges the publish. This proves handoff to MQTT,
+    # not delivery to ESP; ESP must still return R|message_id|OK for end-to-end confirmation.
+    try:
+        result.wait_for_publish(timeout=5.0)
+    except TypeError:
+        result.wait_for_publish()
+    if hasattr(result, "is_published") and not result.is_published():
+        raise TimeoutError("MQTT broker did not acknowledge challenge publish within 5 s")
+
+    log_tx(
+        f"MQTT broker ACK <- challenge accepted by broker device_id={item['device_id']} "
+        f"message_id={item['message_id']} mid={getattr(result, 'mid', '?')}; waiting for ESP R|message_id|OK"
     )
 
 
@@ -177,20 +227,22 @@ def challenge_retry_loop(client, base_topic):
             for device_id, why in to_drop:
                 item = pending_challenges.pop(device_id, None)
                 if item:
-                    print(
-                        f"CHALLENGE delivery failed device_id={device_id} message_id={item['message_id']} "
-                        f"reason={why} attempts={item['attempts']}; no more messages queued",
-                        flush=True,
+                    log_error(
+                        f"challenge delivery failed device_id={device_id} message_id={item['message_id']} "
+                        f"reason={why} attempts={item['attempts']}; no more messages queued"
                     )
 
         for item in to_retry:
-            publish_pending_challenge(client, base_topic, item, "retry")
+            try:
+                publish_pending_challenge(client, base_topic, item, "retry")
+            except Exception as exc:
+                log_error(f"challenge MQTT retry failed device_id={item['device_id']}: {exc}")
 
 
 def handle_application_ack(payload, topic_device):
     parts = payload.split("|")
     if len(parts) != 3 or parts[0] != "R" or not MESSAGE_ID_RE.fullmatch(parts[1]):
-        print(f"OTA transport ACK ignored malformed payload={payload}", flush=True)
+        log_error(f"transport ACK ignored malformed payload={payload}")
         return
 
     message_id = parts[1].lower()
@@ -200,26 +252,19 @@ def handle_application_ack(payload, topic_device):
         return
     device_id = normalize_device_id(compact_id)
 
+    log_zigbee(f"RX application ACK <- ESP device_id={device_id} message_id={message_id} status={status}")
     with pending_lock:
         item = pending_challenges.get(device_id)
         if item is None or item["message_id"].lower() != message_id:
-            print(
-                f"OTA transport ACK unmatched device_id={device_id} message_id={message_id} status={status}",
-                flush=True,
-            )
+            log_error(f"transport ACK unmatched device_id={device_id} message_id={message_id} status={status}")
             return
         if status == "OK":
             pending_challenges.pop(device_id, None)
-            print(
-                f"OTA transport ACK complete device_id={device_id} message_id={message_id} "
-                f"attempts={item['attempts']}; challenge confirmed by ESP",
-                flush=True,
+            log_verify(
+                f"end-to-end challenge delivery confirmed device_id={device_id} message_id={message_id} attempts={item['attempts']}"
             )
         else:
-            print(
-                f"OTA transport ACK negative device_id={device_id} message_id={message_id} status={status}",
-                flush=True,
-            )
+            log_error(f"transport ACK negative device_id={device_id} message_id={message_id} status={status}")
 
 
 def build_client(base_topic, ota_port, expected_ecosystem):
@@ -231,22 +276,18 @@ def build_client(base_topic, ota_port, expected_ecosystem):
     def on_connect(client, userdata, flags, reason_code, properties=None):
         code = int(reason_code) if hasattr(reason_code, "__int__") else reason_code
         if code != 0:
-            print(f"MQTT enrollment connect failed: {reason_code}", flush=True)
+            log_error(f"MQTT connect failed: {reason_code}")
             return
         topic = f"{base_topic}/+/action"
         client.subscribe(topic, qos=0)
-        print(f"MQTT enrollment listener subscribed: {topic}", flush=True)
-        print(
-            "OTA transport policy: ESP uplink APS ACK+fragmentation; one outstanding challenge/device; "
-            "delivery complete only after ESP R|message_id|OK",
-            flush=True,
-        )
+        log_zigbee(f"listener subscribed topic={topic}")
+        log_internal("transport policy: one outstanding challenge/device; MQTT QoS1 broker ACK; final delivery only after ESP application ACK")
 
     def on_message(client, userdata, message):
         try:
             payload = message.payload.decode("utf-8").strip()
         except UnicodeDecodeError:
-            print("MQTT enrollment ignored: non-UTF8 payload", flush=True)
+            log_error("MQTT RX ignored: non-UTF8 payload")
             return
 
         topic_parts = message.topic.split("/")
@@ -260,52 +301,37 @@ def build_client(base_topic, ota_port, expected_ecosystem):
         if not payload.startswith("H|"):
             return
 
-        print(
-            f"HELLO MQTT RX device_topic={topic_device} bytes={len(payload)}; starting certificate/signature verification",
-            flush=True,
-        )
+        log_zigbee(f"RX HELLO <- device_topic={topic_device} bytes={len(payload)} counter={payload.split('|', 2)[1] if '|' in payload else '?'}")
+        log_internal("HELLO received; starting registry/certificate/signature/counter validation")
         try:
             hello = verify_single_hello(payload, topic_device, expected_ecosystem)
         except Exception as e:
-            print(f"HELLO rejected device_topic={topic_device}: {e}", flush=True)
+            log_error(f"HELLO rejected device_topic={topic_device}: {e}")
             return
 
         registered = hello["registered"]
         if hello["status"] == "STALE":
-            print(
-                f"HELLO stale/replay ignored device_id={hello['device_id']} counter={hello['counter']} "
-                f"stored_counter={registered['last_hello_counter']}",
-                flush=True,
+            log_error(
+                f"HELLO stale/replay device_id={hello['device_id']} counter={hello['counter']} stored_counter={registered['last_hello_counter']}"
             )
             return
 
-        print(
-            f"HELLO certificate registry: OK device_id={hello['device_id']} "
-            f"cert_sha256={registered['certificate_fingerprint']} subject={registered['certificate_subject']}",
-            flush=True,
+        log_verify(
+            f"certificate registry OK device_id={hello['device_id']} cert_sha256={registered['certificate_fingerprint']}"
         )
-        print(
-            f"HELLO identity from certificate: ecosystem={registered['ecosystem']} "
-            f"group={registered['device_group']} model={registered['device_model']} "
-            f"role={registered['product_role']} hw={registered['hardware_revision']} "
-            f"chip={registered['chip_family']} flash={registered['flash_size']}",
-            flush=True,
+        log_verify(
+            f"identity OK ecosystem={registered['ecosystem']} group={registered['device_group']} model={registered['device_model']} "
+            f"role={registered['product_role']} hw={registered['hardware_revision']} chip={registered['chip_family']} flash={registered['flash_size']}"
         )
-        print(
-            f"HELLO ECDSA signature verification: OK device_id={hello['device_id']} "
-            f"counter={hello['counter']} counter_policy=strictly-greater-gaps-allowed",
-            flush=True,
-        )
+        log_verify(f"ECDSA signature OK device_id={hello['device_id']} counter={hello['counter']} counter_policy=strictly-greater-gaps-allowed")
 
         now = time.monotonic()
         with pending_lock:
             existing = pending_challenges.get(hello["device_id"])
             if existing is not None:
-                print(
+                log_internal(
                     f"HELLO accepted but challenge already outstanding device_id={hello['device_id']} "
-                    f"message_id={existing['message_id']} attempts={existing['attempts']}; "
-                    "no new challenge queued",
-                    flush=True,
+                    f"message_id={existing['message_id']} attempts={existing['attempts']}; no new challenge queued"
                 )
                 return
 
@@ -318,7 +344,7 @@ def build_client(base_topic, ota_port, expected_ecosystem):
             if not re.fullmatch(r"[0-9a-f]{64}", challenge_hex):
                 raise ValueError("challenge is not 64 hex chars")
         except Exception as e:
-            print(f"MQTT enrollment challenge creation failed device_id={hello['device_id']}: {e}", flush=True)
+            log_error(f"challenge creation failed device_id={hello['device_id']}: {e}")
             return
 
         item = {
@@ -335,12 +361,13 @@ def build_client(base_topic, ota_port, expected_ecosystem):
                 return
             pending_challenges[hello["device_id"]] = item
 
-        print(
-            f"HELLO application processing complete device_id={hello['device_id']} counter={hello['counter']} "
-            f"message_id={message_id}; preparing exactly one challenge",
-            flush=True,
+        log_internal(
+            f"challenge ready device_id={hello['device_id']} counter={hello['counter']} message_id={message_id}; handing to MQTT"
         )
-        publish_pending_challenge(client, base_topic, item, "initial")
+        try:
+            publish_pending_challenge(client, base_topic, item, "initial")
+        except Exception as exc:
+            log_error(f"challenge MQTT publish failed device_id={hello['device_id']} message_id={message_id}: {exc}")
 
     client.on_connect = on_connect
     client.on_message = on_message
@@ -358,28 +385,23 @@ def main():
             service = get_mqtt_service()
             break
         except Exception as e:
-            print(f"MQTT service unavailable, retrying: {e}", flush=True)
+            log_error(f"MQTT service unavailable, retrying: {e}")
             time.sleep(3)
 
     client = build_client(base_topic, ota_port, expected_ecosystem)
     if service["username"]:
         client.username_pw_set(service["username"], service["password"])
 
-    retry_thread = threading.Thread(
-        target=challenge_retry_loop,
-        args=(client, base_topic),
-        name="challenge-retry",
-        daemon=True,
-    )
+    retry_thread = threading.Thread(target=challenge_retry_loop, args=(client, base_topic), name="challenge-retry", daemon=True)
     retry_thread.start()
 
     while True:
         try:
-            print(f"MQTT enrollment connecting to {service['host']}:{service['port']}", flush=True)
+            log_zigbee(f"connecting MQTT broker {service['host']}:{service['port']}")
             client.connect(service["host"], service["port"], keepalive=60)
             client.loop_forever(retry_first_connection=True)
         except Exception as e:
-            print(f"MQTT enrollment connection error: {e}; retrying", flush=True)
+            log_error(f"MQTT connection error: {e}; retrying")
             time.sleep(3)
 
 
