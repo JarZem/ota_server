@@ -20,15 +20,14 @@ COMPACT_ID_RE = re.compile(r"^[0-9a-fA-F]{16}$")
 MESSAGE_ID_RE = re.compile(r"^[0-9a-fA-F]{16}$")
 MAX_COUNTER = (1 << 63) - 1
 
-# ANSI colors are supported by the Home Assistant add-on log viewer.
 RESET = "\033[0m"
 BOLD = "\033[1m"
-CYAN = "\033[36m"      # Zigbee/MQTT transport
-GREEN = "\033[32m"     # successful verification / accepted
-YELLOW = "\033[33m"    # internal OTA processing
-MAGENTA = "\033[35m"   # HTTPS/internal service calls
-RED = "\033[31m"       # errors
-BLUE = "\033[34m"      # outgoing transport
+CYAN = "\033[36m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+MAGENTA = "\033[35m"
+RED = "\033[31m"
+BLUE = "\033[34m"
 
 
 def _log(prefix, color, text):
@@ -59,16 +58,12 @@ def log_error(text):
     _log("OTA/ERROR", RED, text)
 
 
-# Application transport policy above MQTT/Zigbee:
-# - only one outstanding challenge per device
-# - no blind flooding when HELLO repeats
-# - MQTT broker acceptance is confirmed with QoS 1
-# - end-to-end delivery is complete only after R|<message_id>|OK comes back from ESP
 CHALLENGE_RETRY_SECONDS = 15
 CHALLENGE_MAX_ATTEMPTS = 3
 CHALLENGE_PENDING_TTL_SECONDS = 90
 
 pending_challenges = {}
+pending_publish_mids = {}
 pending_lock = threading.Lock()
 
 
@@ -187,18 +182,18 @@ def publish_pending_challenge(client, base_topic, item, reason):
     if result.rc != mqtt.MQTT_ERR_SUCCESS:
         raise RuntimeError(f"MQTT publish rejected immediately rc={result.rc}")
 
-    # QoS 1: wait until the broker acknowledges the publish. This proves handoff to MQTT,
-    # not delivery to ESP; ESP must still return R|message_id|OK for end-to-end confirmation.
-    try:
-        result.wait_for_publish(timeout=5.0)
-    except TypeError:
-        result.wait_for_publish()
-    if hasattr(result, "is_published") and not result.is_published():
-        raise TimeoutError("MQTT broker did not acknowledge challenge publish within 5 s")
+    with pending_lock:
+        pending_publish_mids[result.mid] = {
+            "device_id": item["device_id"],
+            "message_id": item["message_id"],
+            "reason": reason,
+        }
 
+    # Do not wait_for_publish() here. Initial publish is called from Paho's on_message
+    # callback; blocking that callback prevents the network loop from processing PUBACK.
     log_tx(
-        f"MQTT broker ACK <- challenge accepted by broker device_id={item['device_id']} "
-        f"message_id={item['message_id']} mid={getattr(result, 'mid', '?')}; waiting for ESP R|message_id|OK"
+        f"MQTT publish queued mid={result.mid} device_id={item['device_id']} "
+        f"message_id={item['message_id']}; PUBACK will be handled asynchronously"
     )
 
 
@@ -282,6 +277,23 @@ def build_client(base_topic, ota_port, expected_ecosystem):
         client.subscribe(topic, qos=0)
         log_zigbee(f"listener subscribed topic={topic}")
         log_internal("transport policy: one outstanding challenge/device; MQTT QoS1 broker ACK; final delivery only after ESP application ACK")
+
+    def on_publish(client, userdata, mid, reason_code=None, properties=None):
+        with pending_lock:
+            info = pending_publish_mids.pop(mid, None)
+        if info is None:
+            return
+        code = int(reason_code) if reason_code is not None and hasattr(reason_code, "__int__") else 0
+        if code not in (0, None):
+            log_error(
+                f"MQTT broker PUBACK error mid={mid} rc={reason_code} device_id={info['device_id']} "
+                f"message_id={info['message_id']}"
+            )
+            return
+        log_tx(
+            f"MQTT broker ACK <- challenge accepted by broker device_id={info['device_id']} "
+            f"message_id={info['message_id']} mid={mid}; waiting for ESP R|message_id|OK"
+        )
 
     def on_message(client, userdata, message):
         try:
@@ -370,6 +382,7 @@ def build_client(base_topic, ota_port, expected_ecosystem):
             log_error(f"challenge MQTT publish failed device_id={hello['device_id']} message_id={message_id}: {exc}")
 
     client.on_connect = on_connect
+    client.on_publish = on_publish
     client.on_message = on_message
     return client
 
