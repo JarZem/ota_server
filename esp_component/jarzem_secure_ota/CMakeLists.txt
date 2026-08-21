@@ -35,7 +35,7 @@ idf_component_register(
         "src/ota_secure_session.c"
         "src/ota_check_auth.c"
         "src/ota_wifi.c"
-        "src/ota_service.c"
+        "src/ota_service_runtime.c"
         "src/zigbee_ota_cluster.c"
         "src/zigbee_ota_control.c"
     INCLUDE_DIRS "include"
