@@ -19,7 +19,7 @@ SECRETS_PATH = "/share/ota_server/secrets.json"
 SUPERVISOR_TOKEN = os.environ.get("SUPERVISOR_TOKEN", "")
 COMPACT_ID_RE = re.compile(r"^[0-9a-fA-F]{16}$")
 MAX_COUNTER = (1 << 63) - 1
-SESSION_TIMEOUT_SECONDS = 60
+SESSION_TIMEOUT_SECONDS = 120
 
 RESET = "\033[0m"
 BOLD = "\033[1m"
@@ -156,6 +156,36 @@ def session_timeout_loop():
                 log_error(f"session timeout device_id={device_id} state={s.state} counter={s.counter}; state -> IDLE")
 
 
+def extract_protocol_payload(message, base_topic):
+    """Accept both Zigbee2MQTT action topic and the normal device JSON state topic.
+
+    Converter returns {action: 'H|...'} / {action: 'R|...'}. Depending on Z2M
+    action handling/settings/version this can appear either as:
+      zigbee2mqtt/<device>/action  payload H|...
+    or:
+      zigbee2mqtt/<device>         payload {"action":"H|...", ...}
+    """
+    parts = message.topic.split("/")
+    if len(parts) == 3 and parts[0] == base_topic and parts[2] == "action":
+        topic_device = parts[1]
+        try:
+            return topic_device, message.payload.decode("utf-8").strip(), "action"
+        except UnicodeDecodeError:
+            return None, None, None
+
+    if len(parts) == 2 and parts[0] == base_topic:
+        topic_device = parts[1]
+        try:
+            obj = json.loads(message.payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None, None, None
+        payload = obj.get("action") if isinstance(obj, dict) else None
+        if isinstance(payload, str):
+            return topic_device, payload.strip(), "state.action"
+
+    return None, None, None
+
+
 def build_client(base_topic, expected_ecosystem, options):
     try:
         client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="ota-server-enrollment")
@@ -167,10 +197,11 @@ def build_client(base_topic, expected_ecosystem, options):
         if code != 0:
             log_error(f"MQTT connect failed: {reason_code}")
             return
-        topic = f"{base_topic}/+/action"
-        client.subscribe(topic, qos=0)
-        log_zigbee(f"listener subscribed topic={topic}")
-        log_internal("state machine: IDLE --H--> WAIT_RESPONSE --R--> PROVISIONING_SENT; timeout=60s; replay/out-of-order dropped")
+        action_topic = f"{base_topic}/+/action"
+        state_topic = f"{base_topic}/+"
+        client.subscribe([(action_topic, 0), (state_topic, 0)])
+        log_zigbee(f"listener subscribed topics={action_topic}, {state_topic}")
+        log_internal("state machine: IDLE --H--> WAIT_RESPONSE --R--> PROVISIONING_SENT; timeout=120s; replay/out-of-order dropped")
 
     def on_publish(client, userdata, mid, reason_code=None, properties=None):
         with pending_lock:
@@ -179,17 +210,16 @@ def build_client(base_topic, expected_ecosystem, options):
             log_tx(f"MQTT broker ACK <- kind={info['kind']} device_id={info['device_id']} mid={mid}")
 
     def on_message(client, userdata, message):
-        try:
-            payload = message.payload.decode("utf-8").strip()
-        except UnicodeDecodeError:
+        topic_device, payload, source = extract_protocol_payload(message, base_topic)
+        if not topic_device or not payload:
             return
-        parts = message.topic.split("/")
-        if len(parts) != 3 or parts[0] != base_topic or parts[2] != "action":
-            return
-        topic_device = parts[1]
         device_id = topic_device_id(topic_device)
         if device_id is None:
             return
+        if not (payload.startswith("H|") or payload.startswith("R|")):
+            return
+
+        log_zigbee(f"protocol frame source={source} topic={message.topic} device_id={device_id} bytes={len(payload)} kind={payload[:1]}")
 
         if payload.startswith("R|"):
             with pending_lock:
@@ -221,14 +251,11 @@ def build_client(base_topic, expected_ecosystem, options):
                 log_error(f"P creation/send failed device_id={device_id}: {exc}")
             return
 
-        if not payload.startswith("H|"):
-            return
-
         with pending_lock:
             existing = pending_sessions.get(device_id)
             state = existing.state if existing else "IDLE"
         if existing is not None:
-            log_error(f"H out-of-order dropped device_id={device_id} state={state}; wait for 60s timeout")
+            log_error(f"H out-of-order dropped device_id={device_id} state={state}; wait for {SESSION_TIMEOUT_SECONDS}s timeout")
             return
 
         log_zigbee(f"RX H <- device_id={device_id} state=IDLE bytes={len(payload)}")
