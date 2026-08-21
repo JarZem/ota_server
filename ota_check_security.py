@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass
 
 from database import db_connect
-from device_registry import get_registered_device, normalize_device_id
+from device_registry import normalize_device_id
 from secure_transport import derive_session_key
 
 CHECK_KEY_DOMAIN = b"JaroslavZemanESP|ota-check-key-v1|"
@@ -17,7 +17,8 @@ CHECK_MAC_DOMAIN = b"JaroslavZemanESP|ota-check-v1|"
 TOKEN_DOMAIN = b"JaroslavZemanESP|ota-download-token-v1|"
 GRANT_RANDOM_LEN = 8
 CHECK_MAC_LEN = 16
-DOWNLOAD_TOKEN_LEN = 16
+# 12 raw bytes -> 16 base64url characters, matching the already tested downloader buffer/parser.
+DOWNLOAD_TOKEN_LEN = 12
 DOWNLOAD_TTL_SECONDS = 300
 
 
