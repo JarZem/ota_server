@@ -12,6 +12,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 
 from device_registry import accept_hello_counter, get_registered_device, normalize_device_id
+from ota_check_security import consume_download_grant_b64, save_provisioning_context
 from secure_transport import build_challenge, build_provisioning, verify_response
 
 OPTIONS_PATH = "/data/options.json"
@@ -181,7 +182,7 @@ def build_client(base_topic, expected_ecosystem, options):
         action_topic = f"{base_topic}/+/action"
         client.subscribe(action_topic, qos=0)
         log_zigbee(f"listener subscribed topic={action_topic}")
-        log_internal("state machine: IDLE --H--> WAIT_RESPONSE --R--> PROVISIONING_SENT; timeout=120s; replay/out-of-order dropped")
+        log_internal("state machine: IDLE --H--> WAIT_RESPONSE --R--> PROVISIONING_SENT; OTA download completion F|random consumes one-time grant")
 
     def on_publish(client, userdata, mid, reason_code=None, properties=None):
         with pending_lock:
@@ -196,10 +197,21 @@ def build_client(base_topic, expected_ecosystem, options):
         device_id = topic_device_id(topic_device)
         if device_id is None:
             return
-        if not (payload.startswith("H|") or payload.startswith("R|")):
+        if not (payload.startswith("H|") or payload.startswith("R|") or payload.startswith("F|")):
             return
 
         log_zigbee(f"protocol frame topic={message.topic} device_id={device_id} bytes={len(payload)} kind={payload[:1]}")
+
+        if payload.startswith("F|"):
+            parts = payload.split("|")
+            if len(parts) != 2 or not parts[1]:
+                log_error(f"F completion malformed device_id={device_id}")
+                return
+            if consume_download_grant_b64(device_id, parts[1]):
+                log_verify(f"OTA download grant consumed device_id={device_id} random={parts[1]}")
+            else:
+                log_error(f"OTA download completion rejected/expired/already-consumed device_id={device_id}")
+            return
 
         if payload.startswith("R|"):
             with pending_lock:
@@ -226,7 +238,8 @@ def build_client(base_topic, expected_ecosystem, options):
                 wire = build_provisioning(session, **config)
                 log_crypto(f"P encrypted AES-256-GCM device_id={device_id} counter={session.counter} bytes={len(wire)}")
                 publish_command(client, base_topic, topic_device, wire, "P-provisioning", device_id)
-                log_internal(f"P queued device_id={device_id}; no further ESP response required")
+                save_provisioning_context(device_id, session.counter, session.random8)
+                log_internal(f"P queued and provisioning context persisted device_id={device_id} counter={session.counter}")
             except Exception as exc:
                 log_error(f"P creation/send failed device_id={device_id}: {exc}")
             return
