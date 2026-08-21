@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from adopt_existing_identity import adopt_existing_identity  # noqa: E402
 from create_device_identity import ask, install_identity  # noqa: E402
 
 SUBMODULE_PATH = Path('external/ota_server')
@@ -127,6 +128,47 @@ def write_project_manifest(project: Path, values: dict) -> None:
     path.write_text(json.dumps(values, indent=2, sort_keys=True) + '\n', encoding='utf-8')
 
 
+def ensure_identity(project: Path, args) -> bool:
+    identity_manifest = project / '.jarzem_ota' / 'identity.json'
+    credential_dir = project / 'device_credentials'
+
+    if identity_manifest.is_file():
+        if not credential_dir.is_dir():
+            raise RuntimeError('OTA identity manifest exists but device_credentials is missing. Restore the original identity files.')
+        print('Existing immutable OTA identity detected; no key/certificate operation performed.')
+        return False
+
+    if credential_dir.is_dir():
+        print('Existing device_credentials detected. Adopting them without changing any key or certificate.')
+        adopt_existing_identity(project)
+        return False
+
+    group = ask('Device group/family')
+    model = ask('Device model')
+    role = ask('Product role/function')
+    hardware = ask('Hardware revision', 'RevA')
+    chip = ask('Chip family', 'ESP32-C6')
+    flash = ask('Flash size', '16MB')
+    ecosystem = ask('Ecosystem', 'JaroslavZemanESP')
+    manufacturing = args.manufacturing_url or ask(
+        'OTA manufacturing HTTPS URL', 'https://192.168.2.120:8451'
+    )
+    install_identity(
+        project,
+        args.device_id or ask('Device Zigbee IEEE'),
+        group,
+        model,
+        role,
+        hardware,
+        chip,
+        flash,
+        ecosystem,
+        (args.ca_dir or Path(ask('Offline CA directory'))).expanduser(),
+        manufacturing,
+    )
+    return True
+
+
 def main() -> None:
     p = argparse.ArgumentParser(
         description='One-time complete JarZem Secure OTA integration for an ESP-IDF Zigbee project.'
@@ -145,54 +187,16 @@ def main() -> None:
     ensure_submodule(project, args.ref)
     patch_root_cmake(project)
     compose_converter(project, args.converter)
+    new_identity = ensure_identity(project, args)
 
-    identity_manifest = project / '.jarzem_ota' / 'identity.json'
-    credential_dir = project / 'device_credentials'
-    new_identity = not identity_manifest.exists() and not credential_dir.exists()
-
-    if new_identity:
-        group = ask('Device group/family')
+    project_manifest = project / '.jarzem_ota' / 'project.json'
+    if not project_manifest.exists():
+        ecosystem = ask('Ecosystem', 'JaroslavZemanESP')
         model = ask('Device model')
         role = ask('Product role/function')
         hardware = ask('Hardware revision', 'RevA')
         chip = ask('Chip family', 'ESP32-C6')
         flash = ask('Flash size', '16MB')
-        ecosystem = ask('Ecosystem', 'JaroslavZemanESP')
-        manufacturing = args.manufacturing_url or ask(
-            'OTA manufacturing HTTPS URL', 'https://192.168.2.120:8451'
-        )
-        install_identity(
-            project,
-            args.device_id or ask('Device Zigbee IEEE'),
-            group,
-            model,
-            role,
-            hardware,
-            chip,
-            flash,
-            ecosystem,
-            (args.ca_dir or Path(ask('Offline CA directory'))).expanduser(),
-            manufacturing,
-        )
-    elif not identity_manifest.is_file() or not credential_dir.is_dir():
-        raise RuntimeError(
-            'Partial OTA identity found. Installer refuses to regenerate or repair keys automatically; '
-            'restore the original identity files.'
-        )
-    else:
-        print('Existing immutable OTA identity detected; no key/certificate operation performed.')
-        group = model = role = hardware = chip = flash = ecosystem = ''
-
-    project_manifest = project / '.jarzem_ota' / 'project.json'
-    if not project_manifest.exists():
-        if not new_identity:
-            ecosystem = ask('Ecosystem', 'JaroslavZemanESP')
-            model = ask('Device model')
-            role = ask('Product role/function')
-            hardware = ask('Hardware revision', 'RevA')
-            chip = ask('Chip family', 'ESP32-C6')
-            flash = ask('Flash size', '16MB')
-
         firmware_product = ask('Firmware product name')
         channel = ask('Firmware channel', 'stable')
         publish_url = args.publish_url or ask(
@@ -221,6 +225,10 @@ def main() -> None:
 
     print('JarZem Secure OTA integration complete.')
     print('No application Zigbee source file was modified.')
+    if new_identity:
+        print('A new immutable CA-signed device identity was created and registered.')
+    else:
+        print('Existing identity was preserved; no private-key generation/replacement occurred.')
     print('OTA hooks esp_zb_device_register/core_action_handler are attached by the linker.')
     print('The submodule commit is part of the ESP project history; builds never update it automatically.')
     print('Next: git add . && git commit, then idf.py fullclean && idf.py build')
