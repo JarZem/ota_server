@@ -1,8 +1,8 @@
 # OTA Server
 
-Home Assistant add-on providing HTTPS OTA firmware delivery, Zigbee2MQTT secure provisioning transport and a manufacturing PKI service for ESP devices.
+Home Assistant add-on providing HTTPS OTA firmware delivery, secure provisioning over Zigbee2MQTT and a manufacturing PKI service for ESP devices.
 
-This README is the primary description of the OTA/ESP trust model, device manufacturing, provisioning protocol and helper scripts used to prepare an ESP for flashing.
+This README is the primary description of the trust model, certificates, manufacturing, provisioning, OTA check and recovery rules. The implementation on the OTA server and in ESP firmware is expected to follow this document.
 
 ## Certificate architecture
 
@@ -27,7 +27,7 @@ HOME ASSISTANT / OTA
   /share/ota_server/cert/ota_server_cert.pem
   /share/ota_server/cert/ota_server_private.pem
   /share/ota_server/cert/ota_server_public.pem
-  /data/device_registry.db  public ESP certificates and metadata
+  device registry          public ESP certificates and metadata
 
 ESP FLASH
   device_private.pem        unique private P-256 key for this ESP
@@ -38,11 +38,15 @@ ESP FLASH
 
 `root_ca_private.pem` never leaves the offline CA workstation. `ota_server_private.pem` exists only on the OTA server. Every ESP has its own private key; private keys are never shared between devices.
 
-During development the ESP private key is embedded in flash. The provisioning protocol does not depend on where the private key is stored, so later it can be moved to protected/eFuse-backed storage without changing the wire protocol.
+During development the ESP private key is embedded in flash. Later it can be moved to protected/eFuse-backed storage without changing the provisioning or OTA protocol.
 
-## Root CA and OTA server certificate
+## Preparing the Root CA and OTA certificate
 
-Run `setup_certificates.py` on the workstation that has access to the offline CA.
+Run:
+
+```bash
+python setup_certificates.py
+```
 
 Requirement:
 
@@ -65,13 +69,13 @@ OTA certificate role URI:
 urn:jarzem:esp:pki:role:ota-server
 ```
 
-When `--ssh-target` is supplied, the script creates `/share/ota_server/cert/` and copies only files OTA needs. It never copies `root_ca_private.pem`.
+When `--ssh-target` is supplied, the script creates `/share/ota_server/cert/` and copies only files needed by the OTA server. It never copies `root_ca_private.pem`.
 
-The OTA certificate/private-key pair is used for HTTPS/TLS, ECDSA authentication and P-256 ECDH during secure provisioning.
+The OTA certificate/private-key pair is used for HTTPS/TLS, ECDSA authentication and P-256 ECDH during provisioning.
 
-## OTA manufacturing HTTPS service
+## Manufacturing HTTPS service
 
-The manufacturing service runs on HTTPS port `8451` using the OTA TLS certificate.
+The manufacturing service runs on HTTPS port `8451`.
 
 ```text
 GET  https://<ota-ip>:8451/api/manufacturing/root-ca.pem
@@ -83,7 +87,7 @@ POST https://<ota-ip>:8451/api/manufacturing/register-device
 
 Registration transports only a public device certificate. OTA accepts it only after verification of the Root CA signature, validity period, `CA:FALSE`, `digitalSignature`, `clientAuth`, P-256 key type, device role and IEEE identity.
 
-Device certificate URIs include for example:
+Device certificate URIs can include:
 
 ```text
 urn:jarzem:esp:pki:role:device
@@ -96,11 +100,11 @@ urn:jarzem:esp:pki:chip:<chip>
 urn:jarzem:esp:pki:flash:<size>
 ```
 
-Manufacturing registration establishes the permanent relationship `DEVICE_ID -> CA-signed public key`. Runtime provisioning later proves possession of the matching private key and sends Wi-Fi/OTA configuration securely.
+Manufacturing registration establishes the permanent relationship between an ESP IEEE identity and its CA-signed public key. Runtime provisioning proves possession of the matching private key.
 
 ## Per-device ESP credentials
 
-The ESP project `JarZem/7button-encoder` contains:
+The ESP project contains:
 
 ```text
 tools/create_device_credentials.py
@@ -127,75 +131,49 @@ device_credentials/
   ota_server_public.pem   public
 ```
 
-The private key is never uploaded to OTA.
-
 Typical use:
 
 ```bash
 python tools/create_device_credentials.py
 ```
 
-The script also accepts explicit `--device-id`, `--group`, `--device-model`, `--product-role`, `--hardware-revision`, `--chip-family`, `--flash-size`, `--ca-dir` and `--ota-url` arguments.
-
-The device certificate contains stable manufacturing identity, so model/family/role/hardware data do not need to be repeated in Zigbee HELLO.
-
-## ESP build, flash and cleanup
-
-CMake embeds:
-
-```text
-device_private.pem
-device_cert.pem
-root_ca_cert.pem
-ota_server_cert.pem
-```
-
-During the prototype phase the firmware binary therefore contains the ESP private key and must be treated as sensitive.
-
-After successful flashing run:
+After successful flashing:
 
 ```bash
 python tools/cleanup_device_credentials.py
 ```
 
-The cleanup helper removes the local private-key workspace and build outputs that may contain the embedded private key. It does not remove the public device registration from OTA.
-
-Do not regenerate device identity merely because firmware changes. A device keeps its identity across firmware builds and OTA updates.
+Do not regenerate device identity merely because firmware changes. A device keeps the same identity across firmware builds and OTA updates.
 
 ## Runtime provisioning architecture
 
-Provisioning is initiated by ESP after the user enables provisioning from Home Assistant.
+Provisioning starts only when the user enables `Enable OTA` in Home Assistant. This switch controls provisioning only; it does not disable OTA firmware checks.
 
 ```text
-Home Assistant GUI
-      |
-      | Enable OTA / provisioning gate
-      v
+Home Assistant
+    |
+    | user enables provisioning
+    v
 Zigbee2MQTT
-      |
-      | endpoint 11 control/status
-      v
+    |
+    v
 ESP
-      |
-      | H / R, endpoint 10, cluster 0xFC00
-      v
-Zigbee2MQTT MQTT action topic
-      |
-      v
-OTA mqtt_listener.py
-      |
-      | A / P via zigbee2mqtt/<device>/set
-      v
-Zigbee2MQTT -> ESP
+    |
+    | authenticated provisioning messages
+    v
+Zigbee2MQTT MQTT
+    |
+    v
+OTA server
 ```
 
-OTA subscribes directly to Zigbee2MQTT MQTT. Home Assistant is only the UI/control path and is not part of the cryptographic protocol.
+The OTA server subscribes directly to Zigbee2MQTT. Home Assistant is only the user interface and is not part of the cryptographic trust chain.
 
-`Enable OTA` controls only provisioning. It must not disable normal OTA check functionality.
+After successful provisioning the ESP automatically turns `Enable OTA` off, while the final successful status remains visible in Home Assistant.
 
-After successful provisioning ESP automatically sets `Enable OTA=false` and reports that change to Zigbee2MQTT/Home Assistant. The final provisioning status remains visible.
+## Provisioning messages
 
-## Secure H/A/R/P provisioning protocol
+The wire protocol uses four main messages:
 
 ```text
 ESP -> OTA   H|counter|signatureESP
@@ -204,74 +182,49 @@ ESP -> OTA   R|signatureESP
 OTA -> ESP   P|base64url(AES-256-GCM(ciphertext||tag16))
 ```
 
-Transport uses endpoint `10`, manufacturer-specific cluster `0xFC00`. MQTT representation remains textual H/A/R/P; A/P may be compact binary on radio to fit Zigbee limits.
+In plain language:
 
-### H - signed HELLO
+- `H` means: the ESP is asking to start a new authenticated provisioning attempt.
+- `A` means: the OTA server has accepted that request and returns a fresh signed challenge.
+- `R` means: the ESP proves that it owns the private key belonging to its registered certificate and accepts the challenge.
+- `P` means: the OTA server sends the encrypted Wi-Fi and OTA configuration.
 
-When provisioning is enabled, ESP starts a fresh provisioning session even when valid provisioning data already exists in NVS. Existing NVS configuration remains valid until a new authenticated P is successfully stored.
+Transport uses endpoint `10`, manufacturer-specific cluster `0xFC00`.
 
-ESP increments its persistent counter and signs:
+## How one successful provisioning attempt works
+
+### 1. The ESP starts a new attempt
+
+When the user enables provisioning, the ESP increments its persistent counter and signs:
 
 ```text
 H|<device_id>|<counter>
 ```
 
-Transmitted frame:
+The transmitted message contains the counter and signature. The OTA server derives the device identity from Zigbee2MQTT, validates the registered certificate, verifies the signature and accepts the request only when the counter is newer than every previously accepted counter from that device.
 
-```text
-H|<counter>|<raw-P256-signature-base64url>
-```
+The counter therefore prevents an old recorded start message from being replayed.
 
-OTA derives device id from the Zigbee2MQTT topic/IEEE, loads the registered certificate, verifies certificate validity and ecosystem, verifies the ECDSA-P256 signature and rejects stale/replayed counters.
+### 2. The OTA server sends a challenge
 
-A device without a CA-validated certificate in the registry is rejected. The active protocol uses no per-device HMAC secret or server master-secret enrollment mechanism.
+The server generates a fresh 8-byte random value and signs a message containing the device identity, counter and random value.
 
-### A - OTA challenge
+Both sides derive the same temporary session key from:
 
-OTA generates a fresh 8-byte random value and signs:
+- P-256 ECDH shared secret;
+- device identity;
+- current counter;
+- current 8-byte random value.
 
-```text
-A|<device_id>|<counter>|<random8 binary>
-```
+The session key itself is never transmitted or stored as a long-term secret.
 
-Transmitted frame:
+### 3. The ESP proves possession of its private key
 
-```text
-A|<random8-base64url>|<raw-P256-signature-base64url>
-```
+The ESP verifies the OTA signature and signs its response. The OTA server accepts the response only when it belongs to the currently active attempt.
 
-ESP verifies the OTA signature using its trusted OTA certificate/Root CA chain.
+### 4. The OTA server sends encrypted provisioning
 
-Both sides derive a per-session key using P-256 ECDH. The final 256-bit session key is derived with HMAC-SHA256 over the ECDH shared secret and:
-
-```text
-JaroslavZemanESP|provisioning-v1|
-+ device_id
-+ counter (uint64 big endian)
-+ random8
-```
-
-The session key is never transmitted.
-
-### R - ESP response
-
-ESP signs:
-
-```text
-R|<device_id>|<counter>|<random8 binary>|OK
-```
-
-and sends:
-
-```text
-R|<raw-P256-signature-base64url>
-```
-
-OTA accepts R only for an active `WAIT_RESPONSE` session and verifies it against the registered ESP public key.
-
-### P - encrypted provisioning
-
-After valid R, OTA sends an AES-256-GCM encrypted provisioning structure containing:
+The encrypted data contains:
 
 ```text
 protocol version
@@ -283,75 +236,188 @@ OTA host
 OTA port
 ```
 
-Nonce and authenticated data are bound to device id, counter and challenge. ESP authenticates and decrypts P and only then replaces the provisioning stored in NVS. Failed validation leaves the previous valid NVS provisioning untouched.
+The OTA address is stored as host plus port received from provisioning. The firmware does not require a fixed OTA download port compiled into the binary.
 
-After successful P:
+The ESP authenticates and decrypts the packet before writing anything to NVS. If validation fails, the previously working provisioning remains untouched.
 
-1. ESP stores the new provisioning in NVS;
-2. status becomes `PROVISIONING | FINISHED`;
-3. ESP sets `Enable OTA=false`;
-4. ESP reports status and `Enable OTA=false` to Home Assistant.
+### 5. The ESP confirms completion
 
-## Session state and replay protection
+Only after the ESP has successfully authenticated, decrypted and stored the new configuration does it:
 
-OTA runtime state:
+1. save the new provisioning context needed by later OTA checks;
+2. set the provisioning status to finished;
+3. set `Enable OTA` to off;
+4. send its combined control/status message back through Zigbee2MQTT.
 
-```text
-IDLE --H--> WAIT_RESPONSE --R--> PROVISIONING_SENT
-```
-
-Sessions expire after 120 seconds. Unexpected ordering and stale counters are rejected.
-
-ESP state:
+The successful completion message is:
 
 ```text
-IDLE -> WAIT_CHALLENGE -> WAIT_PROVISIONING -> PROVISIONED
+T|0|42
 ```
 
-Stored provisioning is configuration data, not permission to skip a newly requested authenticated provisioning session.
+The OTA server does not replace its last successful `counter + random` merely because it sent the encrypted provisioning packet. It replaces that durable context only after receiving this completion confirmation from the ESP.
+
+This is important: if a new provisioning attempt fails halfway through, both sides continue to have the previous known-good OTA security context.
+
+## Provisioning state machine in human terms
+
+The following states are conceptual. Internal program names may differ, but behavior must follow these rules.
+
+### ESP side
+
+```text
+Provisioning disabled / previous configuration available
+            |
+            | user turns Enable OTA on
+            v
+Ready to start a new provisioning attempt
+            |
+            | ESP sends a new signed start request
+            v
+Waiting for a valid challenge from the OTA server
+            |
+            | valid challenge received and verified
+            | ESP sends its signed response
+            v
+Waiting for encrypted provisioning data
+            |
+            | valid encrypted provisioning received and stored
+            v
+Provisioning completed
+            |
+            | ESP reports success and turns Enable OTA off
+            v
+Provisioning disabled / new configuration available
+```
+
+### OTA server side
+
+```text
+No provisioning attempt in progress
+            |
+            | valid signed start request with a newer counter
+            v
+Waiting for the ESP's signed response
+            |
+            | valid response received
+            | server sends encrypted provisioning
+            v
+Waiting for the ESP to confirm that provisioning was stored
+            |
+            | ESP reports provisioning finished and Enable OTA off
+            v
+No provisioning attempt in progress
+```
+
+## Rules for duplicates, lost messages and retries
+
+These rules are mandatory because Zigbee/MQTT delivery may be delayed, duplicated or lost.
+
+A message that does not represent the expected next step must never move the state machine forward.
+
+Examples:
+
+- A challenge received when the ESP is not waiting for a challenge is ignored.
+- Encrypted provisioning received when the ESP is not waiting for provisioning is ignored.
+- An ESP response received when the OTA server is not waiting for that response is ignored.
+- A completion notification received when the OTA server is not waiting for completion is ignored.
+- A start request with an already used or older counter is ignored.
+
+Duplicates must be harmless. Receiving the same old message twice must not restart cryptography, overwrite NVS or change the last successful OTA context.
+
+A new correctly signed start request with a strictly higher counter has a special meaning: it is an explicit request to start a fresh provisioning attempt. The OTA server is allowed to discard an unfinished older attempt and immediately start the new one. It must not force the ESP to wait for an old 120-second timeout merely because a previous response or completion notification was lost.
+
+If an attempt times out on the ESP while `Enable OTA` is still on, the ESP may start another attempt from the beginning using a new counter.
+
+If an attempt times out on the OTA server, only that unfinished attempt is discarded. The last successful provisioning context remains valid.
+
+Turning provisioning on again after a successful run must always be possible. Existing provisioning data is not a reason to refuse a new user-requested provisioning attempt.
+
+Turning provisioning off manually stops the current provisioning attempt but does not erase the last successful configuration or OTA security context.
+
+## Persistent data and failed attempts
+
+Two concepts must not be mixed:
+
+1. temporary data belonging to the provisioning attempt currently in progress;
+2. the last successfully completed provisioning configuration and its `counter + random` security context.
+
+Temporary session data may be discarded at any time after an error, timeout or new valid start request.
+
+The last successfully completed configuration and security context must remain available until another provisioning attempt finishes successfully.
+
+This rule allows provisioning to be attempted repeatedly without making a device unusable after one failed attempt.
 
 ## Endpoint 11 control and status
 
-Endpoint `11` contains the provisioning enable and status attributes. `Enable OTA` is a provisioning gate, not the stored result of the last run.
+Endpoint `11` contains the provisioning enable and status attributes. `Enable OTA` is only the provisioning gate.
 
 Status is an 8-bit field:
 
 ```text
-bit 7  0x80  ERROR
-bit 6  0x40  PROVISIONING
-bit 5  0x20  FIRMWARE
-bit 4  0x10  VERIFY
-bit 3  0x08  SKIPPED
-bit 2  0x04  TIMEOUT
-bit 1  0x02  FINISHED
-bit 0  0x01  STARTED
+bit 7  0x80  error
+bit 6  0x40  provisioning
+bit 5  0x20  firmware
+bit 4  0x10  verification
+bit 3  0x08  skipped
+bit 2  0x04  timeout
+bit 1  0x02  finished
+bit 0  0x01  started
 ```
 
-Current combinations:
+Examples:
 
 ```text
 0x00  idle
-0x41  provisioning_started
-0x42  provisioning_finished
-0xC2  provisioning_error
-0xC6  provisioning_timeout
-0x21  firmware_update_started
-0x22  firmware_update_finished
-0xA2  firmware_update_error
-0xB2  firmware_verify_error
-0x2A  firmware_skipped
+0x41  provisioning + started
+0x42  provisioning + finished
+0xC2  error + provisioning + finished
+0xC6  error + provisioning + timeout + finished
+0x21  firmware + started
+0x22  firmware + finished
+0xA2  error + firmware + finished
+0xB2  error + firmware + verification + finished
+0x2A  firmware + skipped + finished
 ```
 
-After boot/flash ESP initializes and reports:
+Zigbee2MQTT decodes the bits rather than relying on a fixed table of every possible byte value.
+
+After boot or normal flash the ESP reports:
 
 ```text
 Enable OTA = false
 Status     = idle
 ```
 
-Manually setting `Enable OTA=false` closes only the provisioning gate; it does not erase the previous result. Successful provisioning closes the gate automatically.
+The current implementation also sends a compact control/status uplink such as:
 
-If eight bits become insufficient, the attribute can be migrated to `UINT16` while preserving the lower-eight-bit meanings.
+```text
+T|0|00
+T|1|41
+T|0|42
+```
+
+This keeps Home Assistant synchronized without relying on problematic manual reporting of manufacturer-specific ZCL attributes.
+
+## OTA firmware check and temporary download token
+
+The firmware check is independent from `Enable OTA`.
+
+The OTA server sends:
+
+```text
+C|<version>|<three-character-code>|<fresh-random>|<MAC>
+```
+
+The MAC is calculated from a key derived from the last successfully completed provisioning session. The provisioning session key is reconstructed from the stored device identity, successful provisioning counter, successful provisioning random value and P-256 ECDH secret. The session key itself does not need to be stored.
+
+The ESP first authenticates the check. Only after authentication does it compare the offered firmware version with the running version.
+
+A separate fresh random value in each firmware check is used to derive a one-time HTTPS Bearer token. OTA and ESP independently derive the same token; the token itself is not transmitted over Zigbee.
+
+The OTA server grants the token for at most five minutes. A completed firmware download consumes the grant immediately. An expired or already consumed token is rejected.
+
+The last successful provisioning `counter + random` is therefore long-lived context for authenticated OTA checks, while the HTTPS download token is short-lived and unique to a specific check/download attempt.
 
 ## Main implementation files
 
@@ -359,19 +425,21 @@ OTA side:
 
 ```text
 mqtt_listener.py
-  Zigbee2MQTT MQTT connection, H/R state machine, certificate lookup,
-  HELLO verification, replay checks, sends A and P
+  provisioning state machine, certificate verification, retries,
+  challenge/provisioning transport and completion confirmation
 
 secure_transport.py
-  OTA key/certificate loading, A signing, P-256 ECDH,
-  R verification, AES-256-GCM provisioning encoding
+  OTA signing, P-256 ECDH, ESP-response verification,
+  AES-256-GCM provisioning encoding
+
+ota_check_security.py
+  durable successful provisioning context and one-time download grants
 
 device_registry.py
-  registered device identities, public keys/certificate metadata,
-  accepted HELLO counter persistence
+  registered device certificates and accepted start counters
 
 manufacturing_api.py
-  Root/OTA public material and CA-validated device registration
+  CA-validated device registration and public trust material
 
 setup_certificates.py
   Root CA / OTA certificate preparation and deployment
@@ -380,42 +448,41 @@ setup_certificates.py
 ESP side:
 
 ```text
-tools/create_device_credentials.py
-  generate/sign/register one device identity and fetch OTA trust material
-
-tools/cleanup_device_credentials.py
-  remove sensitive local build material after flashing
-
-main/device_credentials.c
-  device key/certificate access, signing and ECDH
-
-main/device_identity.c
-  device IEEE and persistent enrollment counter
-
 main/ota_secure_session.c
-  H/A/R/P secure state, AES-GCM validation and NVS storage
+  provisioning state machine, challenge verification,
+  encrypted provisioning validation and NVS storage
+
+main/ota_check_auth.c
+  durable successful OTA context, firmware-check authentication
+  and token derivation
 
 main/zigbee_ota_cluster.c
-  endpoint 10 provisioning transport
+  endpoint 10 protocol transport
 
 main/zigbee_ota_control.c
-  endpoint 11 provisioning enable/status
+  endpoint 11 Enable OTA and status handling
+
+main/device_credentials.c
+  device signing, certificate trust and ECDH
+
+main/device_identity.c
+  device IEEE identity and persistent increasing counter
 ```
 
 ## Provisioning configuration and secrets
 
-OTA-owned provisioning values are conceptually:
+Server-owned provisioning values are:
 
 ```text
 wifi_ssid
-wifi_password (secret)
+wifi_password
 wifi_security
 wifi_channel
 ota_host
 ota_port
 ```
 
-Wi-Fi password belongs in the server secrets store, not in the device certificate or clear Zigbee messages. Device family/model/role/hardware data belong in the CA-signed device certificate/registry.
+Wi-Fi password belongs in the server secret store, not in the device certificate or clear Zigbee messages. Device family/model/role/hardware metadata belong in the CA-signed certificate and registry.
 
 ## Tests
 
@@ -431,7 +498,7 @@ Secure-target helper:
 tools/test_ota_secure_target.py
 ```
 
-Tests and helpers must follow the certificate-based H/A/R/P protocol described here.
+Tests should include repeated provisioning, duplicate/out-of-order messages, lost completion confirmation, timeout/restart and preservation of the previous successful context after a failed new attempt.
 
 ## Security rules
 
@@ -446,6 +513,6 @@ firmware binaries containing embedded device_private.pem
 
 The Root CA private key remains offline. Home Assistant receives only the public Root CA and OTA's own private key/certificate. Each ESP receives only its own private key plus public certificates.
 
-Compromise of one ESP private key compromises that device identity, not the Root CA or other ESP private keys. A stolen device certificate alone is public information and is insufficient to impersonate the ESP.
+Compromise of one ESP private key compromises that device identity, not the Root CA or other ESP private keys. A stolen public device certificate alone is insufficient to impersonate the ESP.
 
 Compromise of the OTA private key is more serious because it allows authentication as the OTA server and participation in provisioning sessions, but it still cannot mint a new valid ESP identity or OTA certificate without the offline Root CA private key.
