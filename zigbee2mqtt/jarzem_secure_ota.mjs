@@ -39,8 +39,8 @@ const decodeOtaControlUplink=(payload)=>{
     const match=/^T\|([01])\|([0-9A-Fa-f]{2})$/.exec(payload);
     if(!match)return undefined;
     return{
-        enable_ota_ota_control:match[1]==='1'?'ON':'OFF',
-        ota_status_ota_control:decodeOtaStatus(parseInt(match[2],16)),
+        enable_ota:match[1]==='1'?'ON':'OFF',
+        ota_status:decodeOtaStatus(parseInt(match[2],16)),
     };
 };
 
@@ -78,8 +78,9 @@ const logOtaUplink=(msg,meta,payload)=>{
 const otaUplinkState=(msg,meta,payload)=>{
     logOtaUplink(msg,meta,payload);
     const control=decodeOtaControlUplink(payload);
-    // action is intentionally emitted as well: OTA server subscribes to Zigbee2MQTT /action.
-    return control?{...control,action:payload}:{action:payload};
+    // Internal OTA transport is deliberately not exposed as Home Assistant action.
+    // OTA server reads ota_transport from the normal Zigbee2MQTT device state topic.
+    return control?{...control,ota_transport:payload}:{ota_transport:payload};
 };
 
 const fromCommand={cluster:OTA_CLUSTER_NAME,type:['commandOtaFromDevice'],convert:(model,msg,publish,options,meta)=>{
@@ -106,12 +107,12 @@ const fromRaw={cluster:OTA_CLUSTER_NAME,type:['raw'],convert:(model,msg,publish,
 
 const fromEnable={cluster:OTA_ENABLE_CLUSTER_NAME,type:['attributeReport','readResponse'],convert:(model,msg)=>{
     if(msg.endpoint.ID!==OTA_CONTROL_ENDPOINT||msg.data?.[OTA_ENABLE_ATTR_NAME]===undefined)return;
-    return{enable_ota_ota_control:msg.data[OTA_ENABLE_ATTR_NAME]?'ON':'OFF'};
+    return{enable_ota:msg.data[OTA_ENABLE_ATTR_NAME]?'ON':'OFF'};
 }};
 
 const fromStatus={cluster:OTA_STATUS_CLUSTER_NAME,type:['attributeReport','readResponse'],convert:(model,msg)=>{
     if(msg.endpoint.ID!==OTA_CONTROL_ENDPOINT||msg.data?.[OTA_STATUS_ATTR_NAME]===undefined)return;
-    return{ota_status_ota_control:decodeOtaStatus(msg.data[OTA_STATUS_ATTR_NAME])};
+    return{ota_status:decodeOtaStatus(msg.data[OTA_STATUS_ATTR_NAME])};
 }};
 
 const toCommand={key:['ota_command'],convertSet:async(entity,key,value,meta)=>{
@@ -129,7 +130,7 @@ const toEnable={key:['enable_ota'],convertSet:async(entity,key,value,meta)=>{
     if(!endpoint)throw new Error(`OTA control endpoint ${OTA_CONTROL_ENDPOINT} not found on device; re-interview device`);
     const enabled=String(value).toUpperCase()==='ON'||value===true||value===1;
     await endpoint.write(OTA_ENABLE_CLUSTER_NAME,{[OTA_ENABLE_ATTR_NAME]:enabled},{manufacturerCode:OTA_MANUFACTURER_CODE});
-    return{state:{enable_ota_ota_control:enabled?'ON':'OFF'}};
+    return{state:{enable_ota:enabled?'ON':'OFF'}};
 },convertGet:async(entity,key,meta)=>{
     const endpoint=otaControlEndpoint(entity,meta);
     if(!endpoint)throw new Error(`OTA control endpoint ${OTA_CONTROL_ENDPOINT} not found on device; re-interview device`);
@@ -151,10 +152,12 @@ export const extend=[
 export const fromZigbee=[fromCommand,fromRaw,fromEnable,fromStatus];
 export const toZigbee=[toCommand,toEnable,getStatus];
 export const exposes=[
-    e.binary('enable_ota',ea.STATE_SET,'ON','OFF').withEndpoint('ota_control'),
-    e.text('ota_status',ea.STATE_GET).withEndpoint('ota_control'),
+    e.binary('enable_ota',ea.STATE_SET,'ON','OFF'),
+    e.text('ota_status',ea.STATE_GET),
 ];
-export const endpointMap={ota_control:OTA_CONTROL_ENDPOINT};
+// OTA endpoints are addressed explicitly by the converters above. They are not
+// added to the public endpoint map so HA does not suffix entity names/topics.
+export const endpointMap={};
 
 export const configure=async(device,coordinatorEndpoint,logger)=>{
     if(!device.getEndpoint(OTA_ENDPOINT))logger?.warn?.(`JarZem OTA endpoint ${OTA_ENDPOINT} not found`);
