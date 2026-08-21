@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 
 from cryptography import x509
-from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.x509.oid import NameOID
 
 REQUIRED = (
@@ -61,7 +61,7 @@ def adopt_existing_identity(project: Path) -> dict:
     manifest = {
         'schema': 1,
         'device_id': device_id,
-        'certificate_sha256': cert.fingerprint(__import__('cryptography').hazmat.primitives.hashes.SHA256()).hex(),
+        'certificate_sha256': cert.fingerprint(hashes.SHA256()).hex(),
         'files': {name: sha256_file(credential_dir / name) for name in REQUIRED},
         'adopted_existing_identity': True,
     }
