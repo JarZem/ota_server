@@ -26,6 +26,43 @@ const augment=(definition)=>({{
 export default Array.isArray(projectDefinition)?projectDefinition.map(augment):augment(projectDefinition);
 """
 
+LEGACY_OTA_MARKERS = (
+    'enable_ota_ota_control',
+    'ota_status_ota_control',
+    ".withEndpoint('ota_control')",
+    '.withEndpoint("ota_control")',
+)
+
+PROJECT_OTA_MARKERS = (
+    'jarzemOta',
+    'OTA_CLUSTER_ID',
+    'OTA_CONTROL_ENDPOINT',
+    'enable_ota',
+    'ota_status',
+    'ota_command',
+)
+
+
+def _validate_project_only(path: Path, text: str) -> None:
+    found = [marker for marker in PROJECT_OTA_MARKERS if marker in text]
+    if found:
+        raise SystemExit(
+            f'Project-only Zigbee2MQTT converter {path} contains OTA implementation: {", ".join(found)}. '
+            'OTA code must live only in the ota_server submodule.'
+        )
+
+
+def _validate_ota_module(path: Path, text: str) -> None:
+    found = [marker for marker in LEGACY_OTA_MARKERS if marker in text]
+    if found:
+        raise SystemExit(
+            f'OTA Zigbee2MQTT module {path} contains legacy HA endpoint-suffixed names: {", ".join(found)}'
+        )
+    required = ('enable_ota', 'ota_status', 'ota_transport')
+    missing = [marker for marker in required if marker not in text]
+    if missing:
+        raise SystemExit(f'OTA Zigbee2MQTT module {path} is incomplete, missing: {", ".join(missing)}')
+
 
 def main() -> None:
     p = argparse.ArgumentParser()
@@ -51,6 +88,11 @@ def main() -> None:
     if not ota_part.is_file():
         raise SystemExit(f'Missing OTA Zigbee2MQTT module: {ota_part}')
 
+    project_text = project_part.read_text(encoding='utf-8')
+    ota_text = ota_part.read_text(encoding='utf-8')
+    _validate_project_only(project_part, project_text)
+    _validate_ota_module(ota_part, ota_text)
+
     base_name = project_part.name[:-len('.project.mjs')]
     wrapper_name = base_name + '.mjs'
     ota_name = base_name + '.ota.mjs'
@@ -61,12 +103,19 @@ def main() -> None:
 
     shutil.copy2(project_part, output / project_part.name)
     shutil.copy2(ota_part, output / ota_name)
-    (output / wrapper_name).write_text(
+    wrapper_path = output / wrapper_name
+    wrapper_path.write_text(
         WRAPPER_TEMPLATE.format(project_name=project_part.name, ota_name=ota_name),
         encoding='utf-8',
     )
 
+    # Final guard: never publish a legacy monolithic converter again.
+    wrapper_text = wrapper_path.read_text(encoding='utf-8')
+    if any(marker in wrapper_text for marker in LEGACY_OTA_MARKERS):
+        raise SystemExit('Generated Zigbee2MQTT wrapper unexpectedly contains legacy OTA endpoint suffixes')
+
     print(f'Zigbee2MQTT bundle ready: {output}')
+    print('  OTA HA entities: enable_ota, ota_status (no endpoint suffix)')
     for path in sorted(output.glob('*.mjs')):
         print(' ', path.name)
 
