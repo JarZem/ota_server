@@ -3,6 +3,7 @@ from __future__ import annotations
 import server
 from database import assert_schema_current, database_summary, db_connect
 from firmware_publish import handle_publish
+from zigbee2mqtt_publish import handle_zigbee2mqtt_publish
 from ota_check_runtime import (
     consume_dispatch_token,
     create_dispatch_token,
@@ -44,7 +45,7 @@ server.write_ota_payload_to_zigbee = write_ota_payload_to_zigbee
 
 
 class SecureOTAHandler(server.OTAHandler):
-    """Main OTA HTTPS handler with secure firmware publish support."""
+    """Main OTA HTTPS handler with secure firmware and Zigbee2MQTT publish support."""
 
     def copyfile(self, source, outputfile):
         completed = False
@@ -79,17 +80,25 @@ class SecureOTAHandler(server.OTAHandler):
                 flush=True,
             )
             return handle_publish(self)
+        if parsed.path == '/api/zigbee2mqtt/publish':
+            print(
+                f'Zigbee2MQTT converter publish request received from {self.client_address[0]}',
+                flush=True,
+            )
+            return handle_zigbee2mqtt_publish(self)
         return super().do_POST()
 
 
-# start_servers() resolves server.OTAHandler when it creates the HTTPS server,
-# so replace the class itself instead of monkey-patching individual methods.
 server.OTAHandler = SecureOTAHandler
 
 
 if __name__ == '__main__':
     print(
         'Firmware publish HTTPS endpoint active: POST /api/firmware/publish handler=SecureOTAHandler',
+        flush=True,
+    )
+    print(
+        'Zigbee2MQTT publish HTTPS endpoint active: POST /api/zigbee2mqtt/publish',
         flush=True,
     )
     server.start_servers()
