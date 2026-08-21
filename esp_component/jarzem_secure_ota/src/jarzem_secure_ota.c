@@ -12,13 +12,13 @@
 #include "zigbee_ota_control.h"
 
 static const char *TAG = "jarzem_secure_ota";
-static jarzem_ota_project_action_handler_t s_project_handler;
+static esp_zb_core_action_callback_t s_project_handler;
 static bool s_endpoints_added;
 static bool s_runtime_initialized;
 
 /* Original ESP-Zigbee symbols made available by GNU ld --wrap. */
 extern esp_err_t __real_esp_zb_device_register(esp_zb_ep_list_t *ep_list);
-extern void __real_esp_zb_core_action_handler_register(esp_zb_core_action_handler_t cb);
+extern void __real_esp_zb_core_action_handler_register(esp_zb_core_action_callback_t cb);
 
 __attribute__((weak)) void jarzem_ota_hook_rx_from_ha(void) {}
 __attribute__((weak)) void jarzem_ota_hook_provision_step(void) {}
@@ -27,11 +27,6 @@ static esp_err_t ensure_runtime_initialized(void)
 {
     if (s_runtime_initialized) return ESP_OK;
 
-    /*
-     * Projects initialize NVS before starting Zigbee. The transparent wrapper
-     * is reached during Zigbee endpoint registration, therefore this is the
-     * first project-independent point where the OTA runtime can safely start.
-     */
     ESP_RETURN_ON_ERROR(device_identity_init(), TAG,
                         "device identity initialization failed");
     ota_service_init();
@@ -127,11 +122,6 @@ static esp_err_t ota_action_handler(esp_zb_core_action_callback_id_t callback_id
                : ESP_OK;
 }
 
-/*
- * Transparent integration points. Existing ESP projects keep calling the
- * normal Espressif API. GNU ld redirects those calls here, OTA attaches its
- * endpoints/handler, and the original ESP-Zigbee function is called next.
- */
 esp_err_t __wrap_esp_zb_device_register(esp_zb_ep_list_t *application_endpoints)
 {
     ESP_RETURN_ON_ERROR(add_ota_endpoints(application_endpoints), TAG,
@@ -139,13 +129,12 @@ esp_err_t __wrap_esp_zb_device_register(esp_zb_ep_list_t *application_endpoints)
     return __real_esp_zb_device_register(application_endpoints);
 }
 
-void __wrap_esp_zb_core_action_handler_register(esp_zb_core_action_handler_t project_handler)
+void __wrap_esp_zb_core_action_handler_register(esp_zb_core_action_callback_t project_handler)
 {
-    s_project_handler = (jarzem_ota_project_action_handler_t)project_handler;
+    s_project_handler = project_handler;
     __real_esp_zb_core_action_handler_register(ota_action_handler);
 }
 
-/* Backward-compatible explicit API; new projects do not need to call it. */
 esp_err_t jarzem_ota_device_register(esp_zb_ep_list_t *application_endpoints)
 {
     return __wrap_esp_zb_device_register(application_endpoints);
@@ -153,5 +142,5 @@ esp_err_t jarzem_ota_device_register(esp_zb_ep_list_t *application_endpoints)
 
 void jarzem_ota_action_handler_register(jarzem_ota_project_action_handler_t project_handler)
 {
-    __wrap_esp_zb_core_action_handler_register((esp_zb_core_action_handler_t)project_handler);
+    __wrap_esp_zb_core_action_handler_register((esp_zb_core_action_callback_t)project_handler);
 }
