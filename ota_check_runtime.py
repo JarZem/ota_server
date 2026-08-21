@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import threading
+import time
 
 from database import db_connect
+from device_registry import normalize_device_id
 from ota_check_security import create_ota_check_grant, validate_download_token
 
 NOOP_PROVISION_PAYLOAD = "__OTA_PROVISIONING_ALREADY_SECURE__"
@@ -56,3 +59,23 @@ def should_skip_payload(payload: str) -> bool:
 
 def validate_dispatch_token(token: str, code: str, device_id: str, sha256_hex: str, *_args, **_kwargs) -> bool:
     return validate_download_token(token, code, device_id, sha256_hex)
+
+
+def consume_dispatch_token(token: str, device_id: str, sha256_hex: str) -> bool:
+    try:
+        device_id = normalize_device_id(device_id)
+    except Exception:
+        return False
+    token_hash = hashlib.sha256(str(token).encode("ascii", "ignore")).hexdigest()
+    now = int(time.time())
+    with db_connect() as conn:
+        result = conn.execute(
+            """
+            UPDATE download_grants
+            SET consumed_at=?
+            WHERE device_id=? AND sha256=? AND token_hash=?
+              AND consumed_at IS NULL AND expires_at>=?
+            """,
+            (now, device_id, str(sha256_hex).lower(), token_hash, now),
+        )
+    return result.rowcount == 1
