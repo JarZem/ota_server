@@ -1,6 +1,7 @@
 # JarZem Secure OTA bootstrap. Include this before ESP-IDF project.cmake.
 get_filename_component(JARZEM_OTA_REPO_ROOT "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
 get_filename_component(JARZEM_OTA_PROJECT_ROOT "${CMAKE_CURRENT_LIST_DIR}/../../../.." ABSOLUTE)
+get_filename_component(JARZEM_OTA_COMPONENT_ROOT "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
 
 if(DEFINED PYTHON AND EXISTS "${PYTHON}")
     set(JARZEM_OTA_PYTHON "${PYTHON}")
@@ -21,4 +22,6 @@ if(NOT JARZEM_OTA_VALIDATE_RESULT EQUAL 0)
     message(FATAL_ERROR "JarZem Secure OTA pre-build validation failed")
 endif()
 
-list(APPEND EXTRA_COMPONENT_DIRS "${CMAKE_CURRENT_LIST_DIR}")
+# ESP-IDF searches each directory in EXTRA_COMPONENT_DIRS for component
+# subdirectories. Point it at esp_component/, not at jarzem_secure_ota/ itself.
+list(APPEND EXTRA_COMPONENT_DIRS "${JARZEM_OTA_COMPONENT_ROOT}")
