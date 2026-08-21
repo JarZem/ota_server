@@ -48,16 +48,16 @@ server.write_ota_payload_to_zigbee = write_ota_payload_to_zigbee
 
 
 def secure_copyfile(self, source, outputfile):
-    """Stream firmware and consume the five-minute grant only after EOF was sent."""
+    """Stream firmware and consume the five-minute grant only after EOF and socket flush."""
     completed = False
     try:
         while True:
             block = source.read(64 * 1024)
             if not block:
-                completed = True
                 break
             outputfile.write(block)
         outputfile.flush()
+        completed = True
     except (BrokenPipeError, ConnectionResetError):
         return
     finally:
