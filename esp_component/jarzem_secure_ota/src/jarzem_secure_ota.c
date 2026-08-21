@@ -2,16 +2,19 @@
 
 #include <stdbool.h>
 
+#include "device_identity.h"
 #include "esp_check.h"
 #include "esp_log.h"
 #include "esp_zigbee_cluster.h"
 #include "ha/esp_zigbee_ha_standard.h"
+#include "ota_service.h"
 #include "zigbee_ota_cluster.h"
 #include "zigbee_ota_control.h"
 
 static const char *TAG = "jarzem_secure_ota";
 static jarzem_ota_project_action_handler_t s_project_handler;
 static bool s_endpoints_added;
+static bool s_runtime_initialized;
 
 /* Original ESP-Zigbee symbols made available by GNU ld --wrap. */
 extern esp_err_t __real_esp_zb_device_register(esp_zb_ep_list_t *ep_list);
@@ -19,6 +22,24 @@ extern void __real_esp_zb_core_action_handler_register(esp_zb_core_action_handle
 
 __attribute__((weak)) void jarzem_ota_hook_rx_from_ha(void) {}
 __attribute__((weak)) void jarzem_ota_hook_provision_step(void) {}
+
+static esp_err_t ensure_runtime_initialized(void)
+{
+    if (s_runtime_initialized) return ESP_OK;
+
+    /*
+     * Projects initialize NVS before starting Zigbee. The transparent wrapper
+     * is reached during Zigbee endpoint registration, therefore this is the
+     * first project-independent point where the OTA runtime can safely start.
+     */
+    ESP_RETURN_ON_ERROR(device_identity_init(), TAG,
+                        "device identity initialization failed");
+    ota_service_init();
+    ota_service_confirm_app_valid_after_boot(true);
+    s_runtime_initialized = true;
+    ESP_LOGI(TAG, "portable OTA runtime initialized");
+    return ESP_OK;
+}
 
 static esp_err_t add_transport_endpoint(esp_zb_ep_list_t *ep_list)
 {
@@ -63,6 +84,8 @@ static esp_err_t add_ota_endpoints(esp_zb_ep_list_t *ep_list)
     if (s_endpoints_added) return ESP_OK;
     ESP_RETURN_ON_FALSE(ep_list != NULL, ESP_ERR_INVALID_ARG, TAG,
                         "application endpoint list is NULL");
+    ESP_RETURN_ON_ERROR(ensure_runtime_initialized(), TAG,
+                        "OTA runtime initialization failed");
     ESP_RETURN_ON_ERROR(add_transport_endpoint(ep_list), TAG,
                         "OTA endpoint 10 registration failed");
     ESP_RETURN_ON_ERROR(zigbee_ota_control_add_endpoint(ep_list), TAG,
