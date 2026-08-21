@@ -2,6 +2,13 @@ from __future__ import annotations
 
 import server
 from database import assert_schema_current, database_summary, db_connect
+from ota_check_runtime import (
+    create_dispatch_token,
+    make_check_payload,
+    make_noop_provision_payload,
+    should_skip_payload,
+    validate_dispatch_token,
+)
 
 
 def init_mysql_runtime() -> None:
@@ -13,6 +20,30 @@ def init_mysql_runtime() -> None:
 # connection/schema hooks with the central SQLAlchemy/MySQL layer.
 server.db_connect = db_connect
 server.init_db = init_mysql_runtime
+
+# The old UI dispatch path used to create a bearer token, put it into a legacy
+# provisioning frame and then send C|token. Reuse the UI plumbing but replace
+# the cryptographic operations: create_dispatch_token() creates a five-minute
+# one-time grant and make_check_payload() returns the signed C|version|code|random|MAC.
+server.ota_create_token = create_dispatch_token
+server.ota_validate_token = validate_dispatch_token
+server.make_provision_payload = make_noop_provision_payload
+server.make_ota_check_payload = make_check_payload
+
+_original_write_ota_payload_to_zigbee = server.write_ota_payload_to_zigbee
+
+
+def write_ota_payload_to_zigbee(device, payload):
+    if should_skip_payload(payload):
+        print(
+            f"OTA dispatch: legacy provisioning write skipped for ieee={device.get('ieee')}; secure provisioning context already exists",
+            flush=True,
+        )
+        return {"secure_provisioning": "already-completed"}
+    return _original_write_ota_payload_to_zigbee(device, payload)
+
+
+server.write_ota_payload_to_zigbee = write_ota_payload_to_zigbee
 
 
 if __name__ == '__main__':
