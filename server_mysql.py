@@ -86,4 +86,5 @@ server.OTAHandler.do_POST = secure_do_post
 
 
 if __name__ == '__main__':
+    print('Firmware publish HTTPS endpoint active: POST /api/firmware/publish', flush=True)
     server.start_servers()
