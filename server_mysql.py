@@ -43,48 +43,53 @@ def write_ota_payload_to_zigbee(device, payload):
 server.write_ota_payload_to_zigbee = write_ota_payload_to_zigbee
 
 
-def secure_copyfile(self, source, outputfile):
-    """Stream firmware and consume the five-minute grant only after EOF and socket flush."""
-    completed = False
-    try:
-        while True:
-            block = source.read(64 * 1024)
-            if not block:
-                break
-            outputfile.write(block)
-        outputfile.flush()
-        completed = True
-    except (BrokenPipeError, ConnectionResetError):
-        return
-    finally:
-        if completed and self.ota_sha256:
-            auth = self.headers.get("Authorization") or ""
-            device_id = self.headers.get("X-Device-ID") or ""
-            if auth.startswith("Bearer ") and device_id:
-                token = auth[7:].strip()
-                consumed = consume_dispatch_token(token, device_id, self.ota_sha256)
-                print(
-                    f"OTA download grant {'consumed' if consumed else 'already-consumed/expired'} "
-                    f"device_id={device_id} sha256={self.ota_sha256[:12]}",
-                    flush=True,
-                )
+class SecureOTAHandler(server.OTAHandler):
+    """Main OTA HTTPS handler with secure firmware publish support."""
+
+    def copyfile(self, source, outputfile):
+        completed = False
+        try:
+            while True:
+                block = source.read(64 * 1024)
+                if not block:
+                    break
+                outputfile.write(block)
+            outputfile.flush()
+            completed = True
+        except (BrokenPipeError, ConnectionResetError):
+            return
+        finally:
+            if completed and self.ota_sha256:
+                auth = self.headers.get("Authorization") or ""
+                device_id = self.headers.get("X-Device-ID") or ""
+                if auth.startswith("Bearer ") and device_id:
+                    token = auth[7:].strip()
+                    consumed = consume_dispatch_token(token, device_id, self.ota_sha256)
+                    print(
+                        f"OTA download grant {'consumed' if consumed else 'already-consumed/expired'} "
+                        f"device_id={device_id} sha256={self.ota_sha256[:12]}",
+                        flush=True,
+                    )
+
+    def do_POST(self):
+        parsed = server.urllib.parse.urlparse(self.path)
+        if parsed.path == '/api/firmware/publish':
+            print(
+                f'Firmware publish request received from {self.client_address[0]}',
+                flush=True,
+            )
+            return handle_publish(self)
+        return super().do_POST()
 
 
-server.OTAHandler.copyfile = secure_copyfile
-
-_original_do_post = server.OTAHandler.do_POST
-
-
-def secure_do_post(self):
-    parsed = server.urllib.parse.urlparse(self.path)
-    if parsed.path == '/api/firmware/publish':
-        return handle_publish(self)
-    return _original_do_post(self)
-
-
-server.OTAHandler.do_POST = secure_do_post
+# start_servers() resolves server.OTAHandler when it creates the HTTPS server,
+# so replace the class itself instead of monkey-patching individual methods.
+server.OTAHandler = SecureOTAHandler
 
 
 if __name__ == '__main__':
-    print('Firmware publish HTTPS endpoint active: POST /api/firmware/publish', flush=True)
+    print(
+        'Firmware publish HTTPS endpoint active: POST /api/firmware/publish handler=SecureOTAHandler',
+        flush=True,
+    )
     server.start_servers()
