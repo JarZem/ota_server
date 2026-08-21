@@ -5,11 +5,13 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
+import urllib.parse
 from pathlib import Path
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.x509.oid import NameOID
+from cryptography.x509.oid import NameOID, ExtensionOID
 
 REQUIRED = (
     'device_private.pem',
@@ -17,6 +19,7 @@ REQUIRED = (
     'root_ca_cert.pem',
     'ota_server_cert.pem',
 )
+PKI_URI_PREFIX = 'urn:jarzem:esp:pki:'
 
 
 def sha256_file(path: Path) -> str:
@@ -27,13 +30,75 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def adopt_existing_identity(project: Path) -> dict:
+def cert_metadata(cert: x509.Certificate) -> dict[str, str]:
+    result: dict[str, str] = {}
+    org = cert.subject.get_attributes_for_oid(NameOID.ORGANIZATION_NAME)
+    if org:
+        result['ota_ecosystem'] = org[0].value
+    try:
+        san = cert.extensions.get_extension_for_oid(ExtensionOID.SUBJECT_ALTERNATIVE_NAME).value
+    except x509.ExtensionNotFound:
+        san = None
+    if san is not None:
+        mapping = {
+            'model:': 'device_model',
+            'product-role:': 'product_role',
+            'hardware:': 'hardware_revision',
+            'chip:': 'chip_family',
+            'flash:': 'flash_size',
+        }
+        for uri in san.get_values_for_type(x509.UniformResourceIdentifier):
+            if not uri.startswith(PKI_URI_PREFIX):
+                continue
+            tail = uri[len(PKI_URI_PREFIX):]
+            for prefix, key in mapping.items():
+                if tail.startswith(prefix):
+                    result[key] = urllib.parse.unquote(tail[len(prefix):])
+    return result
+
+
+def detect_project_name(project: Path) -> str:
+    cmake = project / 'CMakeLists.txt'
+    if cmake.is_file():
+        match = re.search(r'(?m)^\s*project\s*\(\s*([^\s\)]+)', cmake.read_text(encoding='utf-8', errors='ignore'))
+        if match:
+            return match.group(1)
+    return project.name
+
+
+def ensure_project_manifest(project: Path, cert: x509.Certificate, publish_url: str | None) -> None:
+    path = project / '.jarzem_ota' / 'project.json'
+    if path.is_file():
+        return
+    if not publish_url:
+        return
+    meta = cert_metadata(cert)
+    required = ('ota_ecosystem', 'device_model', 'product_role', 'hardware_revision', 'chip_family', 'flash_size')
+    missing = [key for key in required if not meta.get(key)]
+    if missing:
+        raise RuntimeError('Cannot derive project metadata from existing device certificate: ' + ', '.join(missing))
+    product = detect_project_name(project)
+    data = {
+        'schema': 1,
+        'publish_url': publish_url.rstrip('/'),
+        'firmware_filename': product + '.bin',
+        'firmware': {
+            **meta,
+            'firmware_product': product,
+            'firmware_channel': 'stable',
+            'secure_version': 0,
+            'active': True,
+        },
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+    print(f'OTA project publish manifest created without changing identity: {path}')
+
+
+def adopt_existing_identity(project: Path, publish_url: str | None = None) -> dict:
     project = project.resolve()
     credential_dir = project / 'device_credentials'
     manifest_path = project / '.jarzem_ota' / 'identity.json'
-
-    if manifest_path.exists():
-        return json.loads(manifest_path.read_text(encoding='utf-8'))
 
     missing = [name for name in REQUIRED if not (credential_dir / name).is_file()]
     if missing:
@@ -42,10 +107,15 @@ def adopt_existing_identity(project: Path) -> dict:
             '. Restore the original files; no key will be generated or replaced.'
         )
 
+    cert = x509.load_pem_x509_certificate((credential_dir / 'device_cert.pem').read_bytes())
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+        ensure_project_manifest(project, cert, publish_url)
+        return manifest
+
     key = serialization.load_pem_private_key(
         (credential_dir / 'device_private.pem').read_bytes(), password=None
     )
-    cert = x509.load_pem_x509_certificate((credential_dir / 'device_cert.pem').read_bytes())
     if key.public_key().public_numbers() != cert.public_key().public_numbers():
         raise RuntimeError('Existing device_private.pem does not match device_cert.pem')
 
@@ -68,14 +138,16 @@ def adopt_existing_identity(project: Path) -> dict:
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + '\n', encoding='utf-8')
     print(f'Existing OTA identity adopted without modification: {device_id}')
+    ensure_project_manifest(project, cert, publish_url)
     return manifest
 
 
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument('--project', type=Path, required=True)
+    p.add_argument('--publish-url')
     args = p.parse_args()
-    adopt_existing_identity(args.project)
+    adopt_existing_identity(args.project, args.publish_url)
 
 
 if __name__ == '__main__':
