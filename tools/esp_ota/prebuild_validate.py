@@ -9,7 +9,10 @@ from pathlib import Path
 
 RESERVED_ENDPOINTS = {10: "secure OTA transport", 11: "OTA control/status"}
 RESERVED_CLUSTERS = {0xFC00: "secure OTA transport", 0xFC01: "Enable OTA", 0xFC02: "OTA status"}
-SKIP_DIRS = {'.git', 'build', 'build_full', 'managed_components', '.idea', '.vscode', '__pycache__'}
+SKIP_DIRS = {
+    '.git', 'build', 'build_full', 'build_wifi_diag', 'managed_components',
+    '.idea', '.vscode', '__pycache__', 'diagnostics', '.backup'
+}
 CREDENTIALS = ('device_private.pem', 'device_cert.pem', 'root_ca_cert.pem', 'ota_server_cert.pem')
 
 
@@ -44,7 +47,8 @@ def iter_sources(project: Path, submodule_path: Path):
     for path in project.rglob('*'):
         if not path.is_file() or path.suffix.lower() not in suffixes:
             continue
-        if any(part in SKIP_DIRS for part in path.parts):
+        relative = path.relative_to(project)
+        if any(part in SKIP_DIRS for part in relative.parts):
             continue
         try:
             if path.resolve().is_relative_to(submodule_path):
