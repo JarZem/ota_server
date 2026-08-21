@@ -1,5 +1,5 @@
 name: "OTA Server"
-version: "0.1.24"
+version: "0.1.25"
 slug: "ota_server"
 description: "OTA server"
 
@@ -21,6 +21,7 @@ map:
 
 homeassistant_api: true
 hassio_api: true
+hassio_role: manager
 
 services:
   - mqtt:need
