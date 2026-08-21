@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import server
 from database import assert_schema_current, database_summary, db_connect
+from firmware_publish import handle_publish
 from ota_check_runtime import (
     consume_dispatch_token,
     create_dispatch_token,
@@ -18,15 +19,8 @@ def init_mysql_runtime() -> None:
     print(f'OTA database ready: {database_summary()}', flush=True)
 
 
-# Keep the existing OTA application logic, but replace its legacy SQLite
-# connection/schema hooks with the central SQLAlchemy/MySQL layer.
 server.db_connect = db_connect
 server.init_db = init_mysql_runtime
-
-# The old UI dispatch path used to create a bearer token, put it into a legacy
-# provisioning frame and then send C|token. Reuse the UI plumbing but replace
-# the cryptographic operations: create_dispatch_token() creates a five-minute
-# one-time grant and make_check_payload() returns the signed C|version|code|random|MAC.
 server.ensure_device_can_receive_provisioning = ensure_secure_dispatch_device
 server.ota_create_token = create_dispatch_token
 server.ota_validate_token = validate_dispatch_token
@@ -77,6 +71,18 @@ def secure_copyfile(self, source, outputfile):
 
 
 server.OTAHandler.copyfile = secure_copyfile
+
+_original_do_post = server.OTAHandler.do_POST
+
+
+def secure_do_post(self):
+    parsed = server.urllib.parse.urlparse(self.path)
+    if parsed.path == '/api/firmware/publish':
+        return handle_publish(self)
+    return _original_do_post(self)
+
+
+server.OTAHandler.do_POST = secure_do_post
 
 
 if __name__ == '__main__':
