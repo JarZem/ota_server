@@ -63,6 +63,10 @@ def patch_cmake(project: Path) -> None:
         raise RuntimeError('Top-level CMakeLists.txt does not contain project(...)')
     pre = (
         f'{BEGIN}\n'
+        'set(EXTRA_COMPONENT_DIRS\n'
+        '    "${CMAKE_CURRENT_LIST_DIR}/external/ota_server/esp_component"\n'
+        '    ${EXTRA_COMPONENT_DIRS}\n'
+        ')\n'
         'include("${CMAKE_CURRENT_LIST_DIR}/external/ota_server/esp_component/jarzem_secure_ota/bootstrap.cmake")\n'
         f'{END}\n'
     )
@@ -97,7 +101,6 @@ def ensure_project_component_dependency(project: Path) -> None:
 
 
 def ensure_project_converter(project: Path, requested: Path | None) -> None:
-    """Keep only project-owned converter code in the application repository."""
     directory = project / 'zigbee2mqtt'
     if not directory.is_dir() and requested is None:
         return
