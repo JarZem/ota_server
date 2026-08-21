@@ -13,6 +13,8 @@ COPY server.py /
 COPY server_mysql.py /
 COPY mqtt_listener.py /
 COPY secure_transport.py /
+COPY ota_check_security.py /
+COPY ota_check_runtime.py /
 COPY ota_tool.py /usr/local/bin/ota-tool
 COPY alembic.ini /
 COPY migrations /migrations
