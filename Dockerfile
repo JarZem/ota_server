@@ -12,6 +12,7 @@ COPY migrate_legacy_sqlite.py /
 COPY server.py /
 COPY server_mysql.py /
 COPY firmware_publish.py /
+COPY zigbee2mqtt_publish.py /
 COPY mqtt_listener.py /
 COPY secure_transport.py /
 COPY ota_check_security.py /
