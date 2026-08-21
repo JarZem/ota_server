@@ -5,6 +5,7 @@ from database import assert_schema_current, database_summary, db_connect
 from ota_check_runtime import (
     consume_dispatch_token,
     create_dispatch_token,
+    ensure_secure_dispatch_device,
     make_check_payload,
     make_noop_provision_payload,
     should_skip_payload,
@@ -26,6 +27,7 @@ server.init_db = init_mysql_runtime
 # provisioning frame and then send C|token. Reuse the UI plumbing but replace
 # the cryptographic operations: create_dispatch_token() creates a five-minute
 # one-time grant and make_check_payload() returns the signed C|version|code|random|MAC.
+server.ensure_device_can_receive_provisioning = ensure_secure_dispatch_device
 server.ota_create_token = create_dispatch_token
 server.ota_validate_token = validate_dispatch_token
 server.make_provision_payload = make_noop_provision_payload
