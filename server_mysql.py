@@ -3,6 +3,7 @@ from __future__ import annotations
 import server
 from database import assert_schema_current, database_summary, db_connect
 from ota_check_runtime import (
+    consume_dispatch_token,
     create_dispatch_token,
     make_check_payload,
     make_noop_provision_payload,
@@ -44,6 +45,36 @@ def write_ota_payload_to_zigbee(device, payload):
 
 
 server.write_ota_payload_to_zigbee = write_ota_payload_to_zigbee
+
+
+def secure_copyfile(self, source, outputfile):
+    """Stream firmware and consume the five-minute grant only after EOF was sent."""
+    completed = False
+    try:
+        while True:
+            block = source.read(64 * 1024)
+            if not block:
+                completed = True
+                break
+            outputfile.write(block)
+        outputfile.flush()
+    except (BrokenPipeError, ConnectionResetError):
+        return
+    finally:
+        if completed and self.ota_sha256:
+            auth = self.headers.get("Authorization") or ""
+            device_id = self.headers.get("X-Device-ID") or ""
+            if auth.startswith("Bearer ") and device_id:
+                token = auth[7:].strip()
+                consumed = consume_dispatch_token(token, device_id, self.ota_sha256)
+                print(
+                    f"OTA download grant {'consumed' if consumed else 'already-consumed/expired'} "
+                    f"device_id={device_id} sha256={self.ota_sha256[:12]}",
+                    flush=True,
+                )
+
+
+server.OTAHandler.copyfile = secure_copyfile
 
 
 if __name__ == '__main__':
