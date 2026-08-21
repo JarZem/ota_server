@@ -157,33 +157,14 @@ def session_timeout_loop():
 
 
 def extract_protocol_payload(message, base_topic):
-    """Accept both Zigbee2MQTT action topic and the normal device JSON state topic.
-
-    Converter returns {action: 'H|...'} / {action: 'R|...'}. Depending on Z2M
-    action handling/settings/version this can appear either as:
-      zigbee2mqtt/<device>/action  payload H|...
-    or:
-      zigbee2mqtt/<device>         payload {"action":"H|...", ...}
-    """
     parts = message.topic.split("/")
-    if len(parts) == 3 and parts[0] == base_topic and parts[2] == "action":
-        topic_device = parts[1]
-        try:
-            return topic_device, message.payload.decode("utf-8").strip(), "action"
-        except UnicodeDecodeError:
-            return None, None, None
-
-    if len(parts) == 2 and parts[0] == base_topic:
-        topic_device = parts[1]
-        try:
-            obj = json.loads(message.payload.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            return None, None, None
-        payload = obj.get("action") if isinstance(obj, dict) else None
-        if isinstance(payload, str):
-            return topic_device, payload.strip(), "state.action"
-
-    return None, None, None
+    if len(parts) != 3 or parts[0] != base_topic or parts[2] != "action":
+        return None, None
+    try:
+        payload = message.payload.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        return None, None
+    return parts[1], payload
 
 
 def build_client(base_topic, expected_ecosystem, options):
@@ -198,9 +179,8 @@ def build_client(base_topic, expected_ecosystem, options):
             log_error(f"MQTT connect failed: {reason_code}")
             return
         action_topic = f"{base_topic}/+/action"
-        state_topic = f"{base_topic}/+"
-        client.subscribe([(action_topic, 0), (state_topic, 0)])
-        log_zigbee(f"listener subscribed topics={action_topic}, {state_topic}")
+        client.subscribe(action_topic, qos=0)
+        log_zigbee(f"listener subscribed topic={action_topic}")
         log_internal("state machine: IDLE --H--> WAIT_RESPONSE --R--> PROVISIONING_SENT; timeout=120s; replay/out-of-order dropped")
 
     def on_publish(client, userdata, mid, reason_code=None, properties=None):
@@ -210,7 +190,7 @@ def build_client(base_topic, expected_ecosystem, options):
             log_tx(f"MQTT broker ACK <- kind={info['kind']} device_id={info['device_id']} mid={mid}")
 
     def on_message(client, userdata, message):
-        topic_device, payload, source = extract_protocol_payload(message, base_topic)
+        topic_device, payload = extract_protocol_payload(message, base_topic)
         if not topic_device or not payload:
             return
         device_id = topic_device_id(topic_device)
@@ -219,7 +199,7 @@ def build_client(base_topic, expected_ecosystem, options):
         if not (payload.startswith("H|") or payload.startswith("R|")):
             return
 
-        log_zigbee(f"protocol frame source={source} topic={message.topic} device_id={device_id} bytes={len(payload)} kind={payload[:1]}")
+        log_zigbee(f"protocol frame topic={message.topic} device_id={device_id} bytes={len(payload)} kind={payload[:1]}")
 
         if payload.startswith("R|"):
             with pending_lock:
