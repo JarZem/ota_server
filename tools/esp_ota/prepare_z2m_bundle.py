@@ -7,7 +7,7 @@ import shutil
 from pathlib import Path
 
 WRAPPER_TEMPLATE = """import projectDefinition from './{project_name}';
-import * as ota from './jarzem_secure_ota.mjs';
+import * as ota from './{ota_name}';
 
 const augment=(definition)=>({{
     ...definition,
@@ -53,15 +53,16 @@ def main() -> None:
 
     base_name = project_part.name[:-len('.project.mjs')]
     wrapper_name = base_name + '.mjs'
+    ota_name = base_name + '.ota.mjs'
 
     output.mkdir(parents=True, exist_ok=True)
     for old in output.glob('*.mjs'):
         old.unlink()
 
     shutil.copy2(project_part, output / project_part.name)
-    shutil.copy2(ota_part, output / ota_part.name)
+    shutil.copy2(ota_part, output / ota_name)
     (output / wrapper_name).write_text(
-        WRAPPER_TEMPLATE.format(project_name=project_part.name),
+        WRAPPER_TEMPLATE.format(project_name=project_part.name, ota_name=ota_name),
         encoding='utf-8',
     )
 
