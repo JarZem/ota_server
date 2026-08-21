@@ -1,0 +1,17 @@
+menu "JarZem Secure OTA"
+
+config APP_OTA_DRY_RUN
+    bool "OTA dry-run: download and verify without flashing"
+    default n
+
+config APP_OTA_ALLOW_SAME_VERSION
+    bool "Allow same firmware version for OTA"
+    default n
+
+config APP_INSECURE_LEGACY_PROVISIONING
+    bool "Allow legacy plaintext provisioning"
+    default n
+    help
+        Keep disabled. Secure provisioning uses the certificate-based H/A/R/P protocol.
+
+endmenu
