@@ -7,6 +7,7 @@ import hashlib
 import json
 import ssl
 import subprocess
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
 PUBLISH_DOMAIN = b'JaroslavZemanESP|firmware-publish-v1|'
+Z2M_PUBLISH_DOMAIN = b'JaroslavZemanESP|z2m-publish-v1|'
 
 
 def b64url(data: bytes) -> str:
@@ -44,6 +46,71 @@ def detected_version(project: Path, build: Path) -> str:
         ).strip()
     except Exception:
         return 'unknown'
+
+
+def post_json(request: urllib.request.Request, context: ssl.SSLContext, label: str) -> dict:
+    try:
+        with urllib.request.urlopen(request, timeout=120, context=context) as response:
+            return json.loads(response.read().decode('utf-8'))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode('utf-8', errors='replace')
+        raise SystemExit(f'{label} rejected HTTP {exc.code}: {detail}') from exc
+    except Exception as exc:
+        raise SystemExit(f'{label} failed: {exc}') from exc
+
+
+def publish_zigbee2mqtt_bundle(
+    ota_url: str,
+    project_name: str,
+    build: Path,
+    certificate_path: Path,
+    private_key: ec.EllipticCurvePrivateKey,
+    context: ssl.SSLContext,
+) -> None:
+    bundle_dir = build / 'zigbee2mqtt'
+    expected = [
+        bundle_dir / f'{project_name}.mjs',
+        bundle_dir / f'{project_name}.project.mjs',
+        bundle_dir / f'{project_name}.ota.mjs',
+    ]
+    missing = [str(path) for path in expected if not path.is_file()]
+    if missing:
+        raise SystemExit('Zigbee2MQTT build bundle is incomplete: ' + ', '.join(missing))
+
+    digest = hashlib.sha256()
+    files: dict[str, str] = {}
+    for path in sorted(expected, key=lambda p: p.name):
+        data = path.read_bytes()
+        digest.update(path.name.encode('utf-8'))
+        digest.update(b'\0')
+        digest.update(data)
+        digest.update(b'\0')
+        files[path.name] = base64.b64encode(data).decode('ascii')
+    digest_hex = digest.hexdigest()
+
+    canonical = Z2M_PUBLISH_DOMAIN + project_name.encode('utf-8') + b'|' + digest_hex.encode('ascii')
+    signature = private_key.sign(canonical, ec.ECDSA(hashes.SHA256()))
+    body = json.dumps({
+        'schema': 1,
+        'project': project_name,
+        'files': files,
+        'certificate': b64url(certificate_path.read_bytes()),
+        'signature': b64url(signature),
+    }, separators=(',', ':')).encode('utf-8')
+
+    request = urllib.request.Request(
+        ota_url + '/api/zigbee2mqtt/publish',
+        data=body,
+        headers={'Content-Type': 'application/json'},
+        method='POST',
+    )
+    result = post_json(request, context, 'Zigbee2MQTT converter publish')
+    if result.get('status') != 'PUBLISHED':
+        raise SystemExit(f'Zigbee2MQTT converter publish rejected: {result}')
+    print(
+        f"JarZem OTA Zigbee2MQTT converter published: project={project_name} "
+        f"changed={int(bool(result.get('changed')))}"
+    )
 
 
 def main() -> None:
@@ -104,6 +171,8 @@ def main() -> None:
     ota_url = str(config.get('publish_url') or '').rstrip('/')
     if not ota_url:
         raise SystemExit('publish_url is missing in .jarzem_ota/project.json')
+    context = ssl.create_default_context(cafile=str(root_ca_path))
+
     request = urllib.request.Request(
         ota_url + '/api/firmware/publish',
         data=bin_path.read_bytes(),
@@ -117,16 +186,19 @@ def main() -> None:
         },
         method='POST',
     )
-    context = ssl.create_default_context(cafile=str(root_ca_path))
-    try:
-        with urllib.request.urlopen(request, timeout=120, context=context) as response:
-            result = json.loads(response.read().decode('utf-8'))
-    except Exception as exc:
-        raise SystemExit(f'Firmware publish failed: {exc}') from exc
-
+    result = post_json(request, context, 'Firmware publish')
     if result.get('status') != 'PUBLISHED':
         raise SystemExit(f'Firmware publish rejected: {result}')
     print(f"JarZem OTA firmware published: {firmware_filename} version={metadata['firmware_version']} sha256={digest[:12]}")
+
+    publish_zigbee2mqtt_bundle(
+        ota_url,
+        args.project_name,
+        build,
+        certificate_path,
+        private_key,
+        context,
+    )
 
 
 if __name__ == '__main__':
