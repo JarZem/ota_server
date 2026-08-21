@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -40,7 +39,6 @@ def ensure_submodule(project: Path, ref: str) -> Path:
         run(['git', 'submodule', 'add', SUBMODULE_URL, SUBMODULE_PATH.as_posix()], project)
     elif not modules.is_file() or SUBMODULE_PATH.as_posix() not in modules.read_text(encoding='utf-8', errors='ignore'):
         raise RuntimeError(f'{target} exists but is not the registered OTA submodule')
-
     run(['git', 'fetch', 'origin'], target)
     run(['git', 'checkout', ref], target)
     return target
@@ -51,14 +49,12 @@ def patch_cmake(project: Path) -> None:
     text = path.read_text(encoding='utf-8')
     if BEGIN in text:
         return
-
     idf = 'include($ENV{IDF_PATH}/tools/cmake/project.cmake)'
     if idf not in text:
         raise RuntimeError('Top-level CMakeLists.txt does not contain the standard ESP-IDF project.cmake include')
     project_match = re.search(r'(?m)^\s*project\s*\([^\n]+\)\s*$', text)
     if not project_match:
         raise RuntimeError('Top-level CMakeLists.txt does not contain project(...)')
-
     pre = (
         f'{BEGIN}\n'
         'include("${CMAKE_CURRENT_LIST_DIR}/external/ota_server/esp_component/jarzem_secure_ota/bootstrap.cmake")\n'
@@ -76,83 +72,66 @@ def patch_cmake(project: Path) -> None:
 
 
 def ensure_project_component_dependency(project: Path) -> None:
-    """Add only the public OTA component dependency; never add OTA source files to the app."""
     path = project / 'main' / 'CMakeLists.txt'
     if not path.is_file():
         return
     text = path.read_text(encoding='utf-8')
     if 'jarzem_secure_ota' in text:
         return
-    match = re.search(r'(?m)^(\s*REQUIRES\s*)$', text)
-    if match:
-        pos = match.end()
-        text = text[:pos] + '\n            jarzem_secure_ota' + text[pos:]
-    else:
-        # PUBLIC include is only needed when the project defines optional LED hooks.
+    matches = list(re.finditer(r'(?m)^(\s*REQUIRES\s*)$', text))
+    if not matches:
         return
+    # Add to every conditional idf_component_register branch.
+    shift = 0
+    for match in matches:
+        pos = match.end() + shift
+        insertion = '\n            jarzem_secure_ota'
+        text = text[:pos] + insertion + text[pos:]
+        shift += len(insertion)
     path.write_text(text, encoding='utf-8')
 
 
-def ensure_converter(project: Path, requested: Path | None, submodule: Path) -> None:
+def ensure_project_converter(project: Path, requested: Path | None) -> None:
+    """Keep only project-owned converter code in the application repository."""
     directory = project / 'zigbee2mqtt'
     if not directory.is_dir() and requested is None:
         return
     directory.mkdir(parents=True, exist_ok=True)
 
+    existing_project_parts = sorted(directory.glob('*.project.mjs'))
+    if existing_project_parts:
+        if len(existing_project_parts) != 1:
+            raise RuntimeError('Expected exactly one *.project.mjs converter')
+        return
+
     if requested is not None:
-        wrapper = requested if requested.is_absolute() else project / requested
+        source = requested if requested.is_absolute() else project / requested
     else:
-        wrappers = [p for p in directory.glob('*.mjs') if not p.name.endswith('.project.mjs') and p.name != 'jarzem_secure_ota.mjs']
-        if len(wrappers) != 1:
+        candidates = [p for p in directory.glob('*.mjs') if p.name != 'jarzem_secure_ota.mjs']
+        if len(candidates) != 1:
             return
-        wrapper = wrappers[0]
+        source = candidates[0]
+    if not source.is_file():
+        raise RuntimeError(f'Zigbee2MQTT project converter not found: {source}')
 
-    project_part = wrapper.with_name(wrapper.stem + '.project.mjs')
-    if not project_part.exists():
-        wrapper.rename(project_part)
-
-    ota_source = submodule / 'zigbee2mqtt' / 'jarzem_secure_ota.mjs'
-    if not ota_source.is_file():
-        raise RuntimeError(f'OTA Zigbee2MQTT module missing: {ota_source}')
-
-    wrapper.write_text(
-        f"import projectDefinition from './{project_part.name}';\n"
-        "import * as ota from './jarzem_secure_ota.mjs';\n\n"
-        "const augment=(definition)=>({\n"
-        "  ...definition,\n"
-        "  extend:[...(definition.extend??[]),...ota.extend],\n"
-        "  fromZigbee:[...(definition.fromZigbee??[]),...ota.fromZigbee],\n"
-        "  toZigbee:[...(definition.toZigbee??[]),...ota.toZigbee],\n"
-        "  exposes:[...(definition.exposes??[]),...ota.exposes],\n"
-        "  endpoint:(device)=>({...(typeof definition.endpoint==='function'?definition.endpoint(device):{}),...ota.endpointMap}),\n"
-        "  configure:async(device,coordinatorEndpoint,logger)=>{\n"
-        "    if(definition.configure)await definition.configure(device,coordinatorEndpoint,logger);\n"
-        "    await ota.configure(device,coordinatorEndpoint,logger);\n"
-        "  },\n"
-        "  meta:{...(definition.meta??{}),multiEndpoint:true},\n"
-        "});\n"
-        "export default Array.isArray(projectDefinition)?projectDefinition.map(augment):augment(projectDefinition);\n",
-        encoding='utf-8',
-    )
-    # Keep a local generated copy so the project folder is directly deployable.
-    shutil.copy2(ota_source, directory / 'jarzem_secure_ota.mjs')
+    target = source.with_name(source.stem + '.project.mjs')
+    source.rename(target)
+    print(f'Project-only Zigbee2MQTT converter: {target.relative_to(project)}')
+    print('OTA converter and combined wrapper will be supplied only in build/zigbee2mqtt/.')
 
 
 def ensure_identity(project: Path, args) -> None:
     manifest = project / '.jarzem_ota' / 'identity.json'
     credentials = project / 'device_credentials'
-
     if manifest.is_file():
         if not credentials.is_dir():
             raise RuntimeError('Identity manifest exists but device_credentials is missing; restore the original identity')
         print('Existing immutable OTA identity detected; keys/certificates are untouched.')
         return
-
     if credentials.is_dir():
         print('Existing device_credentials found; adopting identity without changing any key/certificate.')
         adopt_existing_identity(project)
         return
-
     install_identity(
         project,
         args.device_id or ask('Device Zigbee IEEE'),
@@ -207,10 +186,10 @@ def main() -> None:
 
     project = args.project.resolve()
     ensure_project(project)
-    submodule = ensure_submodule(project, args.ref)
+    ensure_submodule(project, args.ref)
     patch_cmake(project)
     ensure_project_component_dependency(project)
-    ensure_converter(project, args.converter, submodule)
+    ensure_project_converter(project, args.converter)
     ensure_identity(project, args)
     ensure_project_manifest(project, args.publish_url)
 
