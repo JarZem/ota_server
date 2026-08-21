@@ -1,17 +1,26 @@
 menu "JarZem Secure OTA"
 
-config APP_OTA_DRY_RUN
-    bool "OTA dry-run: download and verify without flashing"
-    default n
-
 config APP_OTA_ALLOW_SAME_VERSION
-    bool "Allow same firmware version for OTA"
-    default n
-
-config APP_INSECURE_LEGACY_PROVISIONING
-    bool "Allow legacy plaintext provisioning"
+    bool "Allow OTA image with the same version"
     default n
     help
-        Keep disabled. Secure provisioning uses the certificate-based H/A/R/P protocol.
+        If disabled, the OTA module rejects an image whose esp_app_desc
+        version matches the currently running firmware.
+
+config APP_OTA_DRY_RUN
+    bool "OTA dry-run: download and verify only"
+    default y
+    help
+        If enabled, OTA connects to Wi-Fi, downloads the image over HTTPS
+        and verifies SHA256, but does not write an OTA partition, switch the
+        boot partition, or reboot. Disable only when the complete flash path
+        is intentionally being tested.
+
+config APP_INSECURE_LEGACY_PROVISIONING
+    bool "Allow insecure legacy plaintext OTA provisioning"
+    default n
+    help
+        Development-only compatibility switch. Normal operation uses the
+        certificate-based H/A/R/P provisioning state machine.
 
 endmenu
