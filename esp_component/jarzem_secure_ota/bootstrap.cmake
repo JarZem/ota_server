@@ -1,6 +1,6 @@
 # JarZem Secure OTA bootstrap. Include this before ESP-IDF project.cmake.
 get_filename_component(JARZEM_OTA_REPO_ROOT "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
-get_filename_component(JARZEM_OTA_PROJECT_ROOT "${CMAKE_CURRENT_LIST_DIR}/../../.." ABSOLUTE)
+get_filename_component(JARZEM_OTA_PROJECT_ROOT "${CMAKE_CURRENT_LIST_DIR}/../../../.." ABSOLUTE)
 
 if(DEFINED PYTHON AND EXISTS "${PYTHON}")
     set(JARZEM_OTA_PYTHON "${PYTHON}")
