@@ -6,7 +6,11 @@ import time
 
 from database import db_connect
 from device_registry import normalize_device_id
-from ota_check_security import create_ota_check_grant, validate_download_token
+from ota_check_security import (
+    create_ota_check_grant,
+    load_provisioning_context,
+    validate_download_token,
+)
 
 NOOP_PROVISION_PAYLOAD = "__OTA_PROVISIONING_ALREADY_SECURE__"
 _pending = {}
@@ -30,7 +34,15 @@ def _firmware_for_code(code: str, sha256_hex: str) -> dict:
     return dict(row)
 
 
+def ensure_secure_dispatch_device(device_id: str) -> dict:
+    try:
+        return load_provisioning_context(device_id)
+    except Exception as exc:
+        raise PermissionError(f"OTA_CHECK_DENIED_NO_SECURE_PROVISIONING: {exc}") from exc
+
+
 def create_dispatch_token(code: str, device_id: str, sha256_hex: str, *_args, **_kwargs) -> str:
+    ensure_secure_dispatch_device(device_id)
     image = _firmware_for_code(code, sha256_hex)
     version = str(image.get("version") or "").strip()
     if not version:
