@@ -1,22 +1,24 @@
 #!/usr/bin/env python3
-"""Integrate JarZem Secure OTA into an ESP-IDF Zigbee project without hand-editing project source files."""
+"""One-time, repeatable integration of JarZem Secure OTA into an ESP-IDF Zigbee project."""
 from __future__ import annotations
 
 import argparse
 import json
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
 from adopt_existing_identity import adopt_existing_identity  # noqa: E402
 from create_device_identity import ask, install_identity  # noqa: E402
 
 SUBMODULE_PATH = Path('external/ota_server')
 SUBMODULE_URL = 'https://github.com/JarZem/ota_server.git'
-BEGIN_PRE = '# BEGIN JARZEM SECURE OTA - generated, do not edit'
-END_PRE = '# END JARZEM SECURE OTA - generated'
+BEGIN = '# BEGIN JARZEM SECURE OTA - generated, do not edit'
+END = '# END JARZEM SECURE OTA - generated'
 
 
 def run(args: list[str], cwd: Path) -> None:
@@ -24,78 +26,98 @@ def run(args: list[str], cwd: Path) -> None:
     subprocess.run(args, cwd=cwd, check=True)
 
 
-def ensure_git_project(project: Path) -> None:
+def ensure_project(project: Path) -> None:
     if not (project / '.git').exists():
         raise RuntimeError(f'{project} is not a Git working tree')
     if not (project / 'CMakeLists.txt').is_file():
-        raise RuntimeError(f'{project} does not look like an ESP-IDF project')
+        raise RuntimeError(f'{project} is not an ESP-IDF project')
 
 
 def ensure_submodule(project: Path, ref: str) -> Path:
     target = project / SUBMODULE_PATH
-    gitmodules = project / '.gitmodules'
+    modules = project / '.gitmodules'
     if not target.exists():
-        run(['git', 'submodule', 'add', SUBMODULE_URL, str(SUBMODULE_PATH).replace('\\', '/')], project)
-    elif not gitmodules.is_file() or 'external/ota_server' not in gitmodules.read_text(encoding='utf-8', errors='ignore'):
-        raise RuntimeError(f'{target} exists but is not registered as the JarZem OTA Git submodule')
+        run(['git', 'submodule', 'add', SUBMODULE_URL, SUBMODULE_PATH.as_posix()], project)
+    elif not modules.is_file() or SUBMODULE_PATH.as_posix() not in modules.read_text(encoding='utf-8', errors='ignore'):
+        raise RuntimeError(f'{target} exists but is not the registered OTA submodule')
 
     run(['git', 'fetch', 'origin'], target)
     run(['git', 'checkout', ref], target)
     return target
 
 
-def patch_root_cmake(project: Path) -> None:
+def patch_cmake(project: Path) -> None:
     path = project / 'CMakeLists.txt'
     text = path.read_text(encoding='utf-8')
-    if BEGIN_PRE in text:
+    if BEGIN in text:
         return
 
-    idf_include = 'include($ENV{IDF_PATH}/tools/cmake/project.cmake)'
-    if idf_include not in text:
+    idf = 'include($ENV{IDF_PATH}/tools/cmake/project.cmake)'
+    if idf not in text:
         raise RuntimeError('Top-level CMakeLists.txt does not contain the standard ESP-IDF project.cmake include')
-
-    pre = (
-        f'{BEGIN_PRE}\n'
-        'include("${CMAKE_CURRENT_LIST_DIR}/external/ota_server/esp_component/jarzem_secure_ota/bootstrap.cmake")\n'
-        f'{END_PRE}\n\n'
-    )
-    text = text.replace(idf_include, pre + idf_include, 1)
-
     project_match = re.search(r'(?m)^\s*project\s*\([^\n]+\)\s*$', text)
     if not project_match:
         raise RuntimeError('Top-level CMakeLists.txt does not contain project(...)')
 
+    pre = (
+        f'{BEGIN}\n'
+        'include("${CMAKE_CURRENT_LIST_DIR}/external/ota_server/esp_component/jarzem_secure_ota/bootstrap.cmake")\n'
+        f'{END}\n'
+    )
+    text = text.replace(idf, pre + idf, 1)
+    project_match = re.search(r'(?m)^\s*project\s*\([^\n]+\)\s*$', text)
     post = (
-        '\n' + f'{BEGIN_PRE} POST\n'
+        f'\n{BEGIN} POST\n'
         'include("${CMAKE_CURRENT_LIST_DIR}/external/ota_server/esp_component/jarzem_secure_ota/post_project.cmake")\n'
-        f'{END_PRE} POST'
+        f'{END} POST'
     )
     text = text[:project_match.end()] + post + text[project_match.end():]
     path.write_text(text, encoding='utf-8')
 
 
-def compose_converter(project: Path, converter: Path | None) -> None:
-    if converter is None:
-        candidates = sorted((project / 'zigbee2mqtt').glob('*.mjs')) if (project / 'zigbee2mqtt').is_dir() else []
-        candidates = [p for p in candidates if not p.name.endswith('.project.mjs')]
-        if len(candidates) == 1:
-            converter = candidates[0]
-        else:
-            return
-
-    converter = converter if converter.is_absolute() else project / converter
-    if not converter.is_file():
-        raise RuntimeError(f'Zigbee2MQTT converter not found: {converter}')
-
-    project_only = converter.with_name(converter.stem + '.project.mjs')
-    if project_only.exists():
+def ensure_project_component_dependency(project: Path) -> None:
+    """Add only the public OTA component dependency; never add OTA source files to the app."""
+    path = project / 'main' / 'CMakeLists.txt'
+    if not path.is_file():
         return
+    text = path.read_text(encoding='utf-8')
+    if 'jarzem_secure_ota' in text:
+        return
+    match = re.search(r'(?m)^(\s*REQUIRES\s*)$', text)
+    if match:
+        pos = match.end()
+        text = text[:pos] + '\n            jarzem_secure_ota' + text[pos:]
+    else:
+        # PUBLIC include is only needed when the project defines optional LED hooks.
+        return
+    path.write_text(text, encoding='utf-8')
 
-    converter.rename(project_only)
-    ota_import = '../external/ota_server/zigbee2mqtt/jarzem_secure_ota.mjs'
-    converter.write_text(
-        f"import projectDefinition from './{project_only.name}';\n"
-        f"import * as ota from '{ota_import}';\n\n"
+
+def ensure_converter(project: Path, requested: Path | None, submodule: Path) -> None:
+    directory = project / 'zigbee2mqtt'
+    if not directory.is_dir() and requested is None:
+        return
+    directory.mkdir(parents=True, exist_ok=True)
+
+    if requested is not None:
+        wrapper = requested if requested.is_absolute() else project / requested
+    else:
+        wrappers = [p for p in directory.glob('*.mjs') if not p.name.endswith('.project.mjs') and p.name != 'jarzem_secure_ota.mjs']
+        if len(wrappers) != 1:
+            return
+        wrapper = wrappers[0]
+
+    project_part = wrapper.with_name(wrapper.stem + '.project.mjs')
+    if not project_part.exists():
+        wrapper.rename(project_part)
+
+    ota_source = submodule / 'zigbee2mqtt' / 'jarzem_secure_ota.mjs'
+    if not ota_source.is_file():
+        raise RuntimeError(f'OTA Zigbee2MQTT module missing: {ota_source}')
+
+    wrapper.write_text(
+        f"import projectDefinition from './{project_part.name}';\n"
+        "import * as ota from './jarzem_secure_ota.mjs';\n\n"
         "const augment=(definition)=>({\n"
         "  ...definition,\n"
         "  extend:[...(definition.extend??[]),...ota.extend],\n"
@@ -108,73 +130,74 @@ def compose_converter(project: Path, converter: Path | None) -> None:
         "    await ota.configure(device,coordinatorEndpoint,logger);\n"
         "  },\n"
         "  meta:{...(definition.meta??{}),multiEndpoint:true},\n"
-        "});\n\n"
+        "});\n"
         "export default Array.isArray(projectDefinition)?projectDefinition.map(augment):augment(projectDefinition);\n",
         encoding='utf-8',
     )
+    # Keep a local generated copy so the project folder is directly deployable.
+    shutil.copy2(ota_source, directory / 'jarzem_secure_ota.mjs')
 
 
-def write_project_manifest(project: Path, values: dict) -> None:
-    path = project / '.jarzem_ota' / 'project.json'
-    if path.exists():
-        existing = json.loads(path.read_text(encoding='utf-8'))
-        if existing != values:
-            raise RuntimeError(
-                f'{path} already exists with different settings; installer will not silently rewrite an integrated project'
-            )
+def ensure_identity(project: Path, args) -> None:
+    manifest = project / '.jarzem_ota' / 'identity.json'
+    credentials = project / 'device_credentials'
+
+    if manifest.is_file():
+        if not credentials.is_dir():
+            raise RuntimeError('Identity manifest exists but device_credentials is missing; restore the original identity')
+        print('Existing immutable OTA identity detected; keys/certificates are untouched.')
         return
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(values, indent=2, sort_keys=True) + '\n', encoding='utf-8')
-
-
-def ensure_identity(project: Path, args) -> bool:
-    identity_manifest = project / '.jarzem_ota' / 'identity.json'
-    credential_dir = project / 'device_credentials'
-
-    if identity_manifest.is_file():
-        if not credential_dir.is_dir():
-            raise RuntimeError('OTA identity manifest exists but device_credentials is missing. Restore the original identity files.')
-        print('Existing immutable OTA identity detected; no key/certificate operation performed.')
-        return False
-
-    if credential_dir.is_dir():
-        print('Existing device_credentials detected. Adopting them without changing any key or certificate.')
+    if credentials.is_dir():
+        print('Existing device_credentials found; adopting identity without changing any key/certificate.')
         adopt_existing_identity(project)
-        return False
+        return
 
-    group = ask('Device group/family')
-    model = ask('Device model')
-    role = ask('Product role/function')
-    hardware = ask('Hardware revision', 'RevA')
-    chip = ask('Chip family', 'ESP32-C6')
-    flash = ask('Flash size', '16MB')
-    ecosystem = ask('Ecosystem', 'JaroslavZemanESP')
-    manufacturing = args.manufacturing_url or ask(
-        'OTA manufacturing HTTPS URL', 'https://192.168.2.120:8451'
-    )
     install_identity(
         project,
         args.device_id or ask('Device Zigbee IEEE'),
-        group,
-        model,
-        role,
-        hardware,
-        chip,
-        flash,
-        ecosystem,
+        ask('Device group/family'),
+        ask('Device model'),
+        ask('Product role/function'),
+        ask('Hardware revision', 'RevA'),
+        ask('Chip family', 'ESP32-C6'),
+        ask('Flash size', '16MB'),
+        ask('Ecosystem', 'JaroslavZemanESP'),
         (args.ca_dir or Path(ask('Offline CA directory'))).expanduser(),
-        manufacturing,
+        args.manufacturing_url or ask('OTA manufacturing HTTPS URL', 'https://192.168.2.120:8451'),
     )
-    return True
+
+
+def ensure_project_manifest(project: Path, publish_url: str | None) -> None:
+    path = project / '.jarzem_ota' / 'project.json'
+    if path.is_file():
+        return
+    firmware_product = ask('Firmware product name')
+    data = {
+        'schema': 1,
+        'publish_url': publish_url or ask('OTA firmware HTTPS URL', 'https://192.168.2.120:8443'),
+        'firmware_filename': firmware_product + '.bin',
+        'firmware': {
+            'ota_ecosystem': ask('Ecosystem', 'JaroslavZemanESP'),
+            'device_model': ask('Device model'),
+            'product_role': ask('Product role/function'),
+            'firmware_product': firmware_product,
+            'hardware_revision': ask('Hardware revision', 'RevA'),
+            'chip_family': ask('Chip family', 'ESP32-C6'),
+            'flash_size': ask('Flash size', '16MB'),
+            'firmware_channel': ask('Firmware channel', 'stable'),
+            'secure_version': 0,
+            'active': True,
+        },
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, sort_keys=True) + '\n', encoding='utf-8')
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(
-        description='One-time complete JarZem Secure OTA integration for an ESP-IDF Zigbee project.'
-    )
+    p = argparse.ArgumentParser(description='Install JarZem Secure OTA into an ESP-IDF Zigbee project.')
     p.add_argument('project', type=Path)
-    p.add_argument('--ref', default='main', help='OTA git branch/tag/commit to pin in the submodule')
+    p.add_argument('--ref', default='main', help='OTA branch/tag/commit to pin in the Git submodule')
     p.add_argument('--converter', type=Path)
     p.add_argument('--device-id')
     p.add_argument('--ca-dir', type=Path)
@@ -183,55 +206,19 @@ def main() -> None:
     args = p.parse_args()
 
     project = args.project.resolve()
-    ensure_git_project(project)
-    ensure_submodule(project, args.ref)
-    patch_root_cmake(project)
-    compose_converter(project, args.converter)
-    new_identity = ensure_identity(project, args)
-
-    project_manifest = project / '.jarzem_ota' / 'project.json'
-    if not project_manifest.exists():
-        ecosystem = ask('Ecosystem', 'JaroslavZemanESP')
-        model = ask('Device model')
-        role = ask('Product role/function')
-        hardware = ask('Hardware revision', 'RevA')
-        chip = ask('Chip family', 'ESP32-C6')
-        flash = ask('Flash size', '16MB')
-        firmware_product = ask('Firmware product name')
-        channel = ask('Firmware channel', 'stable')
-        publish_url = args.publish_url or ask(
-            'OTA firmware HTTPS URL', 'https://192.168.2.120:8443'
-        )
-        write_project_manifest(
-            project,
-            {
-                'schema': 1,
-                'publish_url': publish_url,
-                'firmware_filename': firmware_product + '.bin',
-                'firmware': {
-                    'ota_ecosystem': ecosystem,
-                    'device_model': model,
-                    'product_role': role,
-                    'firmware_product': firmware_product,
-                    'hardware_revision': hardware,
-                    'chip_family': chip,
-                    'flash_size': flash,
-                    'firmware_channel': channel,
-                    'secure_version': 0,
-                    'active': True,
-                },
-            },
-        )
+    ensure_project(project)
+    submodule = ensure_submodule(project, args.ref)
+    patch_cmake(project)
+    ensure_project_component_dependency(project)
+    ensure_converter(project, args.converter, submodule)
+    ensure_identity(project, args)
+    ensure_project_manifest(project, args.publish_url)
 
     print('JarZem Secure OTA integration complete.')
-    print('No application Zigbee source file was modified.')
-    if new_identity:
-        print('A new immutable CA-signed device identity was created and registered.')
-    else:
-        print('Existing identity was preserved; no private-key generation/replacement occurred.')
-    print('OTA hooks esp_zb_device_register/core_action_handler are attached by the linker.')
-    print('The submodule commit is part of the ESP project history; builds never update it automatically.')
-    print('Next: git add . && git commit, then idf.py fullclean && idf.py build')
+    print('Application Zigbee source code was not modified.')
+    print('Builds validate but never regenerate installed identity files.')
+    print('OTA source revision is pinned by the Git submodule commit.')
+    print('Run: git add . && git commit, then idf.py fullclean && idf.py build')
 
 
 if __name__ == '__main__':
