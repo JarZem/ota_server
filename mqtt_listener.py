@@ -160,13 +160,29 @@ def session_timeout_loop():
 
 def extract_protocol_payload(message, base_topic):
     parts = message.topic.split("/")
-    if len(parts) != 3 or parts[0] != base_topic or parts[2] != "action":
-        return None, None
-    try:
-        payload = message.payload.decode("utf-8").strip()
-    except UnicodeDecodeError:
-        return None, None
-    return parts[1], payload
+
+    # Compatibility with converters deployed before ota_transport was hidden
+    # from Home Assistant. Remove this branch only after all installations have
+    # migrated away from /action.
+    if len(parts) == 3 and parts[0] == base_topic and parts[2] == "action":
+        try:
+            payload = message.payload.decode("utf-8").strip()
+        except UnicodeDecodeError:
+            return None, None
+        return parts[1], payload
+
+    # Current transport: converter publishes an unexposed ota_transport field
+    # on the normal Zigbee2MQTT device state topic. HA never discovers it.
+    if len(parts) == 2 and parts[0] == base_topic:
+        try:
+            state = json.loads(message.payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
+            return None, None
+        payload = state.get("ota_transport") if isinstance(state, dict) else None
+        if isinstance(payload, str) and payload:
+            return parts[1], payload
+
+    return None, None
 
 
 def handle_control_state(device_id, payload):
@@ -211,9 +227,12 @@ def build_client(base_topic, expected_ecosystem, options):
         if code != 0:
             log_error(f"MQTT connect failed: {reason_code}")
             return
+        state_topic = f"{base_topic}/+"
         action_topic = f"{base_topic}/+/action"
+        client.subscribe(state_topic, qos=0)
         client.subscribe(action_topic, qos=0)
-        log_zigbee(f"listener subscribed topic={action_topic}")
+        log_zigbee(f"listener subscribed topic={state_topic} field=ota_transport")
+        log_zigbee(f"compatibility listener subscribed topic={action_topic}")
         log_internal("provisioning state machine ready: new authenticated HELLO may restart an unfinished attempt; provisioning context changes only after ESP confirms completion")
 
     def on_publish(client, userdata, mid, reason_code=None, properties=None):
