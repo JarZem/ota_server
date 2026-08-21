@@ -62,3 +62,8 @@ idf_component_register(
         "${JARZEM_OTA_SERVER_CERT}"
         "${JARZEM_OTA_CA_BUNDLE}"
 )
+
+# Transparent integration: the application continues calling the normal
+# ESP-Zigbee API. The linker routes only these two calls through OTA first.
+idf_build_set_property(LINK_OPTIONS "-Wl,--wrap=esp_zb_device_register" APPEND)
+idf_build_set_property(LINK_OPTIONS "-Wl,--wrap=esp_zb_core_action_handler_register" APPEND)
