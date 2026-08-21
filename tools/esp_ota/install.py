@@ -35,10 +35,16 @@ def ensure_project(project: Path) -> None:
 def ensure_submodule(project: Path, ref: str) -> Path:
     target = project / SUBMODULE_PATH
     modules = project / '.gitmodules'
+    registered = modules.is_file() and SUBMODULE_PATH.as_posix() in modules.read_text(encoding='utf-8', errors='ignore')
+
     if not target.exists():
-        run(['git', 'submodule', 'add', SUBMODULE_URL, SUBMODULE_PATH.as_posix()], project)
-    elif not modules.is_file() or SUBMODULE_PATH.as_posix() not in modules.read_text(encoding='utf-8', errors='ignore'):
+        if registered:
+            run(['git', 'submodule', 'update', '--init', '--recursive', SUBMODULE_PATH.as_posix()], project)
+        else:
+            run(['git', 'submodule', 'add', SUBMODULE_URL, SUBMODULE_PATH.as_posix()], project)
+    elif not registered:
         raise RuntimeError(f'{target} exists but is not the registered OTA submodule')
+
     run(['git', 'fetch', 'origin'], target)
     run(['git', 'checkout', ref], target)
     return target
@@ -81,7 +87,6 @@ def ensure_project_component_dependency(project: Path) -> None:
     matches = list(re.finditer(r'(?m)^(\s*REQUIRES\s*)$', text))
     if not matches:
         return
-    # Add to every conditional idf_component_register branch.
     shift = 0
     for match in matches:
         pos = match.end() + shift
