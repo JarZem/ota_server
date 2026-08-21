@@ -6,14 +6,15 @@ import json
 import os
 import re
 import tempfile
-from datetime import datetime, timezone
 from pathlib import Path
 
 from cryptography import x509
+from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 
+from device_registry import get_registered_device, verify_and_extract_device_certificate
+
 FIRMWARE_DIR = Path('/share/ota_server/firmware')
-ROOT_CA_CERT = Path('/share/ota_server/cert/root_ca_cert.pem')
 MAX_FIRMWARE_BYTES = 16 * 1024 * 1024
 PUBLISH_DOMAIN = b'JaroslavZemanESP|firmware-publish-v1|'
 _FILENAME_RE = re.compile(r'^[A-Za-z0-9_.-]{1,128}\.bin$')
@@ -36,33 +37,26 @@ def _send_json(handler, status: int, payload: dict) -> None:
     handler.close_connection = True
 
 
-def _verified_device_certificate(encoded_cert: str) -> x509.Certificate:
-    if not ROOT_CA_CERT.is_file():
-        raise ValueError('root_ca_missing')
-    cert = x509.load_pem_x509_certificate(_b64url_decode(encoded_cert))
-    root = x509.load_pem_x509_certificate(ROOT_CA_CERT.read_bytes())
-    if cert.issuer != root.subject:
-        raise ValueError('certificate_issuer_mismatch')
-    root_key = root.public_key()
-    if not isinstance(root_key, ec.EllipticCurvePublicKey):
-        raise ValueError('root_key_not_ec')
-    root_key.verify(cert.signature, cert.tbs_certificate_bytes, ec.ECDSA(cert.signature_hash_algorithm))
-    now = datetime.now(timezone.utc)
-    not_before = getattr(cert, 'not_valid_before_utc', cert.not_valid_before.replace(tzinfo=timezone.utc))
-    not_after = getattr(cert, 'not_valid_after_utc', cert.not_valid_after.replace(tzinfo=timezone.utc))
-    if now < not_before or now > not_after:
-        raise ValueError('certificate_expired_or_not_yet_valid')
-    constraints = cert.extensions.get_extension_for_class(x509.BasicConstraints).value
-    if constraints.ca:
-        raise ValueError('publisher_certificate_is_ca')
+def _validated_publisher(encoded_cert: str) -> tuple[x509.Certificate, dict, dict]:
+    certificate_pem = _b64url_decode(encoded_cert)
+    extracted = verify_and_extract_device_certificate(certificate_pem)
+    registered = get_registered_device(extracted['device_id'])
+    if registered is None:
+        raise ValueError('publisher_device_not_registered')
+    if str(registered.get('certificate_fingerprint') or '').lower() != extracted['certificate_fingerprint'].lower():
+        raise ValueError('publisher_certificate_not_current_registered_certificate')
+
+    cert = x509.load_pem_x509_certificate(certificate_pem)
     if not isinstance(cert.public_key(), ec.EllipticCurvePublicKey):
         raise ValueError('publisher_key_not_ec')
-    return cert
+    return cert, extracted, registered
 
 
-def _validate_metadata(metadata: dict, sha256_hex: str, size: int) -> dict:
+def _validate_metadata(metadata: dict, sha256_hex: str, size: int,
+                       publisher: dict, registered: dict) -> dict:
     if not isinstance(metadata, dict):
         raise ValueError('metadata_not_object')
+
     required = (
         'ota_ecosystem', 'device_model', 'product_role', 'firmware_product',
         'hardware_revision', 'chip_family', 'flash_size', 'firmware_channel',
@@ -74,10 +68,33 @@ def _validate_metadata(metadata: dict, sha256_hex: str, size: int) -> dict:
         if not value or len(value) > 96:
             raise ValueError(f'invalid_metadata_{key}')
         result[key] = value
+
+    # A valid CA certificate is not enough to publish firmware for another
+    # device family. Bind publish metadata to both the certificate SAN and the
+    # currently registered device record.
+    bindings = {
+        'ota_ecosystem': ('ecosystem', 'ecosystem'),
+        'device_model': ('device_model', 'device_model'),
+        'product_role': ('product_role', 'product_role'),
+        'hardware_revision': ('hardware_revision', 'hardware_revision'),
+        'chip_family': ('chip_family', 'chip_family'),
+        'flash_size': ('flash_size', 'flash_size'),
+    }
+    for metadata_key, (publisher_key, registered_key) in bindings.items():
+        value = result[metadata_key]
+        cert_value = str(publisher.get(publisher_key) or '').strip()
+        db_value = str(registered.get(registered_key) or '').strip()
+        if cert_value and value != cert_value:
+            raise ValueError(f'publisher_certificate_metadata_mismatch_{metadata_key}')
+        if db_value and value != db_value:
+            raise ValueError(f'publisher_registry_metadata_mismatch_{metadata_key}')
+
     result['secure_version'] = int(metadata.get('secure_version', 0))
     result['active'] = 1 if bool(metadata.get('active', True)) else 0
     result['sha256'] = sha256_hex
     result['size'] = int(size)
+    result['publisher_device_id'] = publisher['device_id']
+    result['publisher_certificate_fingerprint'] = publisher['certificate_fingerprint']
     return result
 
 
@@ -88,6 +105,7 @@ def handle_publish(handler) -> None:
         metadata_b64 = str(handler.headers.get('X-Firmware-Metadata') or '')
         certificate_b64 = str(handler.headers.get('X-Publisher-Certificate') or '')
         signature_b64 = str(handler.headers.get('X-Publisher-Signature') or '')
+
         if not _FILENAME_RE.fullmatch(filename) or os.path.basename(filename) != filename:
             raise ValueError('invalid_filename')
         if not _SHA_RE.fullmatch(expected_sha):
@@ -98,9 +116,10 @@ def handle_publish(handler) -> None:
             raise ValueError('invalid_content_length') from exc
         if length <= 0 or length > MAX_FIRMWARE_BYTES:
             raise ValueError('invalid_firmware_size')
+
         metadata_raw = _b64url_decode(metadata_b64)
         metadata = json.loads(metadata_raw.decode('utf-8'))
-        cert = _verified_device_certificate(certificate_b64)
+        cert, publisher, registered = _validated_publisher(certificate_b64)
         signature = _b64url_decode(signature_b64)
         canonical = (
             PUBLISH_DOMAIN
@@ -108,7 +127,9 @@ def handle_publish(handler) -> None:
             + expected_sha.encode('ascii') + b'|'
             + metadata_b64.encode('ascii')
         )
-        cert.public_key().verify(signature, canonical, ec.ECDSA(hashlib_to_crypto_sha256()))
+        cert.public_key().verify(signature, canonical, ec.ECDSA(hashes.SHA256()))
+
+        release = _validate_metadata(metadata, expected_sha, length, publisher, registered)
 
         FIRMWARE_DIR.mkdir(parents=True, exist_ok=True)
         fd, temp_name = tempfile.mkstemp(prefix='.publish-', suffix='.bin', dir=FIRMWARE_DIR)
@@ -125,10 +146,11 @@ def handle_publish(handler) -> None:
                     remaining -= len(block)
                 out.flush()
                 os.fsync(out.fileno())
+
             actual_sha = digest.hexdigest()
             if actual_sha != expected_sha:
                 raise ValueError('firmware_sha256_mismatch')
-            release = _validate_metadata(metadata, actual_sha, length)
+
             target = FIRMWARE_DIR / filename
             release_path = FIRMWARE_DIR / (target.stem + '.release.json')
             release_temp = release_path.with_suffix(release_path.suffix + '.tmp')
@@ -142,13 +164,18 @@ def handle_publish(handler) -> None:
                 pass
             raise
 
-        print(f'Firmware publish accepted filename={filename} bytes={length} sha256={expected_sha[:12]}', flush=True)
-        _send_json(handler, 201, {'status': 'PUBLISHED', 'filename': filename, 'sha256': expected_sha, 'size': length})
+        print(
+            f"Firmware publish accepted device_id={publisher['device_id']} filename={filename} "
+            f"bytes={length} sha256={expected_sha[:12]}",
+            flush=True,
+        )
+        _send_json(handler, 201, {
+            'status': 'PUBLISHED',
+            'publisher_device_id': publisher['device_id'],
+            'filename': filename,
+            'sha256': expected_sha,
+            'size': length,
+        })
     except Exception as exc:
         print(f'Firmware publish rejected: {exc}', flush=True)
         _send_json(handler, 400, {'status': 'ERROR', 'error': str(exc)})
-
-
-def hashlib_to_crypto_sha256():
-    from cryptography.hazmat.primitives import hashes
-    return hashes.SHA256()
