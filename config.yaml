@@ -1,5 +1,5 @@
 name: "OTA Server"
-version: "0.1.30"
+version: "0.1.31"
 slug: "ota_server"
 description: "OTA server"
 
