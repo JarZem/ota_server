@@ -12,6 +12,7 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 
+from activity import record_firmware_publish
 from device_registry import get_registered_device, verify_and_extract_device_certificate
 
 FIRMWARE_DIR = Path('/share/ota_server/firmware')
@@ -69,9 +70,6 @@ def _validate_metadata(metadata: dict, sha256_hex: str, size: int,
             raise ValueError(f'invalid_metadata_{key}')
         result[key] = value
 
-    # A valid CA certificate is not enough to publish firmware for another
-    # device family. Bind publish metadata to both the certificate SAN and the
-    # currently registered device record.
     bindings = {
         'ota_ecosystem': ('ecosystem', 'ecosystem'),
         'device_model': ('device_model', 'device_model'),
@@ -128,7 +126,6 @@ def handle_publish(handler) -> None:
             + metadata_b64.encode('ascii')
         )
         cert.public_key().verify(signature, canonical, ec.ECDSA(hashes.SHA256()))
-
         release = _validate_metadata(metadata, expected_sha, length, publisher, registered)
 
         FIRMWARE_DIR.mkdir(parents=True, exist_ok=True)
@@ -164,17 +161,18 @@ def handle_publish(handler) -> None:
                 pass
             raise
 
+        record_firmware_publish(
+            version=release['firmware_version'], filename=filename, sha256=expected_sha,
+            size=length, publisher_device_id=publisher['device_id'],
+            certificate_fingerprint=publisher['certificate_fingerprint'],
+        )
         print(
             f"Firmware publish accepted device_id={publisher['device_id']} filename={filename} "
-            f"bytes={length} sha256={expected_sha[:12]}",
-            flush=True,
+            f"bytes={length} sha256={expected_sha[:12]}", flush=True,
         )
         _send_json(handler, 201, {
-            'status': 'PUBLISHED',
-            'publisher_device_id': publisher['device_id'],
-            'filename': filename,
-            'sha256': expected_sha,
-            'size': length,
+            'status': 'PUBLISHED', 'publisher_device_id': publisher['device_id'],
+            'filename': filename, 'sha256': expected_sha, 'size': length,
         })
     except Exception as exc:
         print(f'Firmware publish rejected: {exc}', flush=True)
