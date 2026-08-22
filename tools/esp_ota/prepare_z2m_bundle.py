@@ -1,67 +1,84 @@
 #!/usr/bin/env python3
-"""Create a deployable Zigbee2MQTT bundle from project-only code + pinned OTA module."""
+"""Create one self-contained deployable Zigbee2MQTT converter from project + OTA code."""
 from __future__ import annotations
 
 import argparse
-import shutil
+import re
+import subprocess
 from pathlib import Path
 
-WRAPPER_TEMPLATE = """import projectDefinition from './{project_name}';
-import * as ota from './{ota_name}';
-
-const augment=(definition)=>({{
-    ...definition,
-    extend:[...(definition.extend??[]),...ota.extend],
-    fromZigbee:[...(definition.fromZigbee??[]),...ota.fromZigbee],
-    toZigbee:[...(definition.toZigbee??[]),...ota.toZigbee],
-    exposes:[...(definition.exposes??[]),...ota.exposes],
-    endpoint:(device)=>({{...(typeof definition.endpoint==='function'?definition.endpoint(device):{{}}),...ota.endpointMap}}),
-    configure:async(device,coordinatorEndpoint,logger)=>{{
-        if(definition.configure)await definition.configure(device,coordinatorEndpoint,logger);
-        await ota.configure(device,coordinatorEndpoint,logger);
-    }},
-    meta:{{...(definition.meta??{{}}),multiEndpoint:true}},
-}});
-
-export default Array.isArray(projectDefinition)?projectDefinition.map(augment):augment(projectDefinition);
-"""
-
 LEGACY_OTA_MARKERS = (
-    'enable_ota_ota_control',
-    'ota_status_ota_control',
-    ".withEndpoint('ota_control')",
-    '.withEndpoint("ota_control")',
+    'enable_ota_ota_control', 'ota_status_ota_control',
+    ".withEndpoint('ota_control')", '.withEndpoint("ota_control")',
+)
+PROJECT_OTA_MARKERS = (
+    'jarzemOta', 'OTA_CLUSTER_ID', 'OTA_CONTROL_ENDPOINT',
+    'enable_ota', 'ota_status', 'ota_command',
 )
 
-PROJECT_OTA_MARKERS = (
-    'jarzemOta',
-    'OTA_CLUSTER_ID',
-    'OTA_CONTROL_ENDPOINT',
-    'enable_ota',
-    'ota_status',
-    'ota_command',
-)
+
+def _version(project: Path) -> str:
+    try:
+        return subprocess.check_output(
+            ['git', '-C', str(project), 'describe', '--tags', '--always', '--dirty'],
+            text=True, stderr=subprocess.DEVNULL, timeout=5,
+        ).strip()
+    except Exception:
+        return 'unknown'
 
 
 def _validate_project_only(path: Path, text: str) -> None:
-    found = [marker for marker in PROJECT_OTA_MARKERS if marker in text]
+    found = [m for m in PROJECT_OTA_MARKERS if m in text]
     if found:
-        raise SystemExit(
-            f'Project-only Zigbee2MQTT converter {path} contains OTA implementation: {", ".join(found)}. '
-            'OTA code must live only in the ota_server submodule.'
-        )
+        raise SystemExit(f'Project-only converter {path} contains OTA implementation: {", ".join(found)}')
 
 
 def _validate_ota_module(path: Path, text: str) -> None:
-    found = [marker for marker in LEGACY_OTA_MARKERS if marker in text]
+    found = [m for m in LEGACY_OTA_MARKERS if m in text]
     if found:
-        raise SystemExit(
-            f'OTA Zigbee2MQTT module {path} contains legacy HA endpoint-suffixed names: {", ".join(found)}'
-        )
-    required = ('enable_ota', 'ota_status', 'ota_transport')
-    missing = [marker for marker in required if marker not in text]
+        raise SystemExit(f'OTA module {path} contains legacy endpoint-suffixed names: {", ".join(found)}')
+    missing = [m for m in ('enable_ota', 'ota_status', 'ota_transport') if m not in text]
     if missing:
-        raise SystemExit(f'OTA Zigbee2MQTT module {path} is incomplete, missing: {", ".join(missing)}')
+        raise SystemExit(f'OTA module {path} is incomplete, missing: {", ".join(missing)}')
+
+
+def _remove_imports(text: str) -> str:
+    return re.sub(r'^import\s+.*?;\s*$', '', text, flags=re.MULTILINE)
+
+
+def _make_monolith(project_text: str, ota_text: str, version: str) -> str:
+    # The project converter contract intentionally uses exposes alias `e`.
+    # OTA owns the common imports so the deployed file has no local imports.
+    project_body = _remove_imports(project_text)
+    project_body, count = re.subn(r'export\s+default\s+definition\s*;', 'const projectDefinition=definition;', project_body)
+    if count != 1:
+        raise SystemExit('Project converter must end with `export default definition;`')
+
+    ota_body = _remove_imports(ota_text)
+    ota_body = re.sub(r'\bexport\s+const\s+', 'const ', ota_body)
+
+    imports = """import {presets as e, access as ea} from 'zigbee-herdsman-converters/lib/exposes';
+import * as m from 'zigbee-herdsman-converters/lib/modernExtend';
+import {Zcl} from 'zigbee-herdsman';
+"""
+    glue = """
+const jarzemOtaAugment=(definition)=>({
+    ...definition,
+    extend:[...(definition.extend??[]),...extend],
+    fromZigbee:[...(definition.fromZigbee??[]),...fromZigbee],
+    toZigbee:[...(definition.toZigbee??[]),...toZigbee],
+    exposes:[...(definition.exposes??[]),...exposes],
+    endpoint:(device)=>({...(typeof definition.endpoint==='function'?definition.endpoint(device):{}),...endpointMap}),
+    configure:async(device,coordinatorEndpoint,logger)=>{
+        if(definition.configure)await definition.configure(device,coordinatorEndpoint,logger);
+        await configure(device,coordinatorEndpoint,logger);
+    },
+    meta:{...(definition.meta??{}),multiEndpoint:true},
+});
+
+export default Array.isArray(projectDefinition)?projectDefinition.map(jarzemOtaAugment):jarzemOtaAugment(projectDefinition);
+"""
+    return f'// JarZem firmware build: {version}\n// Generated file: project converter + JarZem Secure OTA; do not edit in Home Assistant.\n{imports}\n{project_body.strip()}\n\n{ota_body.strip()}\n{glue}'
 
 
 def main() -> None:
@@ -75,13 +92,9 @@ def main() -> None:
     submodule = args.submodule.resolve()
     output = args.output.resolve()
     source_dir = project / 'zigbee2mqtt'
-
     project_parts = sorted(source_dir.glob('*.project.mjs'))
     if len(project_parts) != 1:
-        raise SystemExit(
-            f'Expected exactly one project-only Zigbee2MQTT converter (*.project.mjs) in {source_dir}, '
-            f'found {len(project_parts)}'
-        )
+        raise SystemExit(f'Expected exactly one *.project.mjs in {source_dir}, found {len(project_parts)}')
 
     project_part = project_parts[0]
     ota_part = submodule / 'zigbee2mqtt' / 'jarzem_secure_ota.mjs'
@@ -93,31 +106,24 @@ def main() -> None:
     _validate_project_only(project_part, project_text)
     _validate_ota_module(ota_part, ota_text)
 
+    version = _version(project)
     base_name = project_part.name[:-len('.project.mjs')]
-    wrapper_name = base_name + '.mjs'
-    ota_name = base_name + '.ota.mjs'
-
     output.mkdir(parents=True, exist_ok=True)
     for old in output.glob('*.mjs'):
         old.unlink()
 
-    shutil.copy2(project_part, output / project_part.name)
-    shutil.copy2(ota_part, output / ota_name)
-    wrapper_path = output / wrapper_name
-    wrapper_path.write_text(
-        WRAPPER_TEMPLATE.format(project_name=project_part.name, ota_name=ota_name),
-        encoding='utf-8',
-    )
+    target = output / f'{base_name}.mjs'
+    target.write_text(_make_monolith(project_text, ota_text, version), encoding='utf-8')
+    generated = target.read_text(encoding='utf-8')
+    if any(marker in generated for marker in LEGACY_OTA_MARKERS):
+        raise SystemExit('Generated converter unexpectedly contains legacy OTA endpoint suffixes')
+    if f'// JarZem firmware build: {version}' not in generated:
+        raise SystemExit('Generated converter build marker missing')
 
-    # Final guard: never publish a legacy monolithic converter again.
-    wrapper_text = wrapper_path.read_text(encoding='utf-8')
-    if any(marker in wrapper_text for marker in LEGACY_OTA_MARKERS):
-        raise SystemExit('Generated Zigbee2MQTT wrapper unexpectedly contains legacy OTA endpoint suffixes')
-
-    print(f'Zigbee2MQTT bundle ready: {output}')
+    print(f'Zigbee2MQTT converter ready: {target}')
+    print(f'  firmware build: {version}')
+    print('  single-file deployment: yes')
     print('  OTA HA entities: enable_ota, ota_status (no endpoint suffix)')
-    for path in sorted(output.glob('*.mjs')):
-        print(' ', path.name)
 
 
 if __name__ == '__main__':
