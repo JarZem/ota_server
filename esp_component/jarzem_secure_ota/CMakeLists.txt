@@ -71,7 +71,13 @@ idf_component_register(
         "${JARZEM_OTA_ROOT_CA}"
         "${JARZEM_OTA_SERVER_CERT}"
         "${JARZEM_OTA_CA_BUNDLE}"
+    WHOLE_ARCHIVE
 )
+
+# OTA integration uses linker wrappers for Espressif Zigbee registration.
+# The component therefore must be linked as a whole archive. Otherwise the
+# wrapper object may be discarded and the application silently registers only
+# its own endpoints (1..9), leaving OTA transport/control endpoints 10/11 out.
 
 # ota_service.c is an imported implementation currently being mechanically
 # reformatted. Keep the component build strict while allowing only this
