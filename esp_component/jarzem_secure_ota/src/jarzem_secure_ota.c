@@ -16,10 +16,6 @@ static esp_zb_core_action_callback_t s_project_handler;
 static bool s_endpoints_added;
 static bool s_runtime_initialized;
 
-/* Original ESP-Zigbee symbols made available by GNU ld --wrap. */
-extern esp_err_t __real_esp_zb_device_register(esp_zb_ep_list_t *ep_list);
-extern void __real_esp_zb_core_action_handler_register(esp_zb_core_action_callback_t cb);
-
 __attribute__((weak)) void jarzem_ota_hook_rx_from_ha(void) {}
 __attribute__((weak)) void jarzem_ota_hook_provision_step(void) {}
 
@@ -122,25 +118,17 @@ static esp_err_t ota_action_handler(esp_zb_core_action_callback_id_t callback_id
                : ESP_OK;
 }
 
-esp_err_t __wrap_esp_zb_device_register(esp_zb_ep_list_t *application_endpoints)
+esp_err_t jarzem_ota_device_register(esp_zb_ep_list_t *application_endpoints)
 {
     ESP_RETURN_ON_ERROR(add_ota_endpoints(application_endpoints), TAG,
                         "could not add OTA endpoints");
-    return __real_esp_zb_device_register(application_endpoints);
-}
-
-void __wrap_esp_zb_core_action_handler_register(esp_zb_core_action_callback_t project_handler)
-{
-    s_project_handler = project_handler;
-    __real_esp_zb_core_action_handler_register(ota_action_handler);
-}
-
-esp_err_t jarzem_ota_device_register(esp_zb_ep_list_t *application_endpoints)
-{
-    return __wrap_esp_zb_device_register(application_endpoints);
+    ESP_LOGI(TAG, "registering application + OTA endpoints with ESP-Zigbee");
+    return esp_zb_device_register(application_endpoints);
 }
 
 void jarzem_ota_action_handler_register(jarzem_ota_project_action_handler_t project_handler)
 {
-    __wrap_esp_zb_core_action_handler_register((esp_zb_core_action_callback_t)project_handler);
+    s_project_handler = (esp_zb_core_action_callback_t)project_handler;
+    esp_zb_core_action_handler_register(ota_action_handler);
+    ESP_LOGI(TAG, "OTA + project Zigbee action handler registered");
 }
