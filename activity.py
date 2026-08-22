@@ -40,11 +40,7 @@ def record_converter_publish(*, version: str, project: str, filename: str, sha25
     now = _now()
     with db_connect() as conn:
         row = conn.execute(
-            """
-            SELECT id FROM artifact_publications
-            WHERE firmware_version=? AND publisher_device_id=?
-            ORDER BY published_at DESC LIMIT 1
-            """,
+            "SELECT id FROM artifact_publications WHERE firmware_version=? AND publisher_device_id=? ORDER BY published_at DESC LIMIT 1",
             (version, normalize_device_id(publisher_device_id)),
         ).fetchone()
         if row:
@@ -62,14 +58,6 @@ def record_converter_publish(*, version: str, project: str, filename: str, sha25
 
 def provisioning_state(device_id: str, counter: int, state: str, error: str | None = None) -> None:
     now = _now()
-    fields = {
-        'CHALLENGE_SENT': 'challenge_sent_at',
-        'RESPONSE_VERIFIED': 'response_verified_at',
-        'PROVISIONING_SENT': 'provisioning_sent_at',
-        'COMPLETED': 'completed_at',
-        'TIMEOUT': 'completed_at',
-        'ERROR': 'completed_at',
-    }
     device_id = normalize_device_id(device_id)
     with db_connect() as conn:
         conn.execute(
@@ -82,12 +70,13 @@ def provisioning_state(device_id: str, counter: int, state: str, error: str | No
             """,
             (device_id, int(counter), state, now, now, error),
         )
-        column = fields.get(state)
-        if column:
-            conn.execute(
-                f"UPDATE provisioning_attempts SET {column}=?, updated_at=?, state=?, error=? WHERE device_id=? AND counter=?",
-                (now, now, state, error, device_id, int(counter)),
-            )
+        if state == 'CHALLENGE_SENT':
+            conn.execute("UPDATE provisioning_attempts SET challenge_sent_at=?, updated_at=?, state=?, error=? WHERE device_id=? AND counter=?", (now, now, state, error, device_id, int(counter)))
+        elif state == 'PROVISIONING_SENT':
+            # P is emitted only after the main state machine has verified R.
+            conn.execute("UPDATE provisioning_attempts SET response_verified_at=COALESCE(response_verified_at, ?), provisioning_sent_at=?, updated_at=?, state=?, error=? WHERE device_id=? AND counter=?", (now, now, now, state, error, device_id, int(counter)))
+        elif state in ('COMPLETED', 'TIMEOUT', 'ERROR'):
+            conn.execute("UPDATE provisioning_attempts SET completed_at=?, updated_at=?, state=?, error=? WHERE device_id=? AND counter=?", (now, now, state, error, device_id, int(counter)))
 
 
 def firmware_device_state(*, device_id: str, sha256: str, filename: str, version: str,
@@ -100,7 +89,7 @@ def firmware_device_state(*, device_id: str, sha256: str, filename: str, version
         'DOWNLOAD_STARTED': 'download_started_at',
         'DOWNLOAD_COMPLETED': 'download_finished_at',
         'DOWNLOAD_FAILED': 'download_failed_at',
-        'GRANT_CONSUMED': 'grant_consumed_at',
+        'DEVICE_CONFIRMED': 'grant_consumed_at',
         'SKIPPED': 'download_finished_at',
     }
     device_id = normalize_device_id(device_id)
@@ -143,29 +132,22 @@ def _e(value) -> str:
 
 def render_ingress_tables() -> str:
     with db_connect() as conn:
-        artifacts = conn.execute(
-            "SELECT * FROM artifact_publications ORDER BY published_at DESC LIMIT 50"
-        ).fetchall()
-        provisioning = conn.execute(
-            "SELECT * FROM provisioning_attempts ORDER BY updated_at DESC LIMIT 100"
-        ).fetchall()
-        device_fw = conn.execute(
-            "SELECT * FROM device_firmware_status ORDER BY updated_at DESC LIMIT 200"
-        ).fetchall()
+        artifacts = conn.execute("SELECT * FROM artifact_publications ORDER BY published_at DESC LIMIT 50").fetchall()
+        provisioning = conn.execute("SELECT * FROM provisioning_attempts ORDER BY updated_at DESC LIMIT 100").fetchall()
+        device_fw = conn.execute("SELECT * FROM device_firmware_status ORDER BY updated_at DESC LIMIT 200").fetchall()
 
     artifact_rows = ''.join(
-        '<tr><td>{}</td><td>{}</td><td><code>{}</code></td><td>{}</td><td><code>{}</code></td>'
-        '<td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>'.format(
+        '<tr><td>{}</td><td>{}</td><td><code>{}</code></td><td>{}</td><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><code>{}</code></td></tr>'.format(
             _e(r['firmware_version']), _e(r['firmware_filename']), _e(str(r['firmware_sha256'])[:12]),
             _e(r['converter_filename']), _e(str(r['converter_sha256'] or '')[:12]),
             'OK' if r['bin_verified'] else 'NO', 'OK' if r['mjs_verified'] else 'NO',
-            'OK' if r['z2m_loaded'] else 'NO', _e(_fmt(r['converter_published_at'] or r['published_at'])))
+            'OK' if r['z2m_loaded'] else 'NO', _e(_fmt(r['converter_published_at'] or r['published_at'])),
+            _e(str(r['publisher_certificate_fingerprint'] or '')[:12]))
         for r in artifacts
-    ) or '<tr><td colspan="9">No published artifact records yet.</td></tr>'
+    ) or '<tr><td colspan="10">No published artifact records yet.</td></tr>'
 
     provisioning_rows = ''.join(
-        '<tr><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>'
-        '<td>{}</td><td>{}</td><td>{}</td></tr>'.format(
+        '<tr><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>'.format(
             _e(r['device_id']), _e(r['counter']), _e(r['state']), _e(_fmt(r['started_at'])),
             _e(_fmt(r['challenge_sent_at'])), _e(_fmt(r['response_verified_at'])),
             _e(_fmt(r['provisioning_sent_at'])), _e(_fmt(r['completed_at'])), _e(r['error']))
@@ -173,20 +155,19 @@ def render_ingress_tables() -> str:
     ) or '<tr><td colspan="9">No provisioning attempts recorded yet.</td></tr>'
 
     firmware_rows = ''.join(
-        '<tr><td><code>{}</code></td><td>{}</td><td>{}</td><td><code>{}</code></td><td>{}</td>'
-        '<td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>'.format(
+        '<tr><td><code>{}</code></td><td>{}</td><td>{}</td><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>'.format(
             _e(r['device_id']), _e(r['firmware_version']), _e(r['firmware_filename']),
-            _e(str(r['firmware_sha256'])[:12]), _e(r['state']), _e(_fmt(r['check_sent_at'] or r['check_created_at'])),
-            _e(_fmt(r['download_started_at'])), _e(_fmt(r['download_finished_at'])),
-            _e(_fmt(r['token_expires_at'])), _e(r['last_error']))
+            _e(str(r['firmware_sha256'])[:12]), _e(r['firmware_code']), _e(r['state']),
+            _e(_fmt(r['check_sent_at'] or r['check_created_at'])), _e(_fmt(r['download_started_at'])),
+            _e(_fmt(r['download_finished_at'])), _e(_fmt(r['token_expires_at'])), _e(r['last_error']))
         for r in device_fw
-    ) or '<tr><td colspan="10">No ESP × firmware activity recorded yet.</td></tr>'
+    ) or '<tr><td colspan="11">No ESP × firmware activity recorded yet.</td></tr>'
 
     return f'''
 <h3>Published BIN + Zigbee2MQTT converter</h3>
-<div class="table-wrap"><table><thead><tr><th>Build</th><th>BIN</th><th>BIN SHA</th><th>MJS</th><th>MJS SHA</th><th>BIN verified</th><th>MJS verified</th><th>Z2M loaded</th><th>Time</th></tr></thead><tbody>{artifact_rows}</tbody></table></div>
+<div class="table-wrap"><table><thead><tr><th>Build</th><th>BIN</th><th>BIN SHA</th><th>MJS</th><th>MJS SHA</th><th>BIN verified</th><th>MJS verified</th><th>Z2M loaded</th><th>Time</th><th>Publisher cert</th></tr></thead><tbody>{artifact_rows}</tbody></table></div>
 <h3>Provisioning attempts</h3>
-<div class="table-wrap"><table><thead><tr><th>ESP</th><th>Counter</th><th>State</th><th>Started</th><th>Challenge</th><th>Response verified</th><th>Provision sent</th><th>Finished</th><th>Error</th></tr></thead><tbody>{provisioning_rows}</tbody></table></div>
+<div class="table-wrap"><table><thead><tr><th>ESP</th><th>Counter</th><th>State</th><th>HELLO seen</th><th>Challenge sent</th><th>Response verified</th><th>Provision sent</th><th>Finished</th><th>Error</th></tr></thead><tbody>{provisioning_rows}</tbody></table></div>
 <h3>ESP × firmware OTA state</h3>
-<div class="table-wrap"><table><thead><tr><th>ESP</th><th>Build</th><th>BIN</th><th>SHA</th><th>State</th><th>CHECK</th><th>Download start</th><th>Download finish</th><th>Token expires</th><th>Error</th></tr></thead><tbody>{firmware_rows}</tbody></table></div>
+<div class="table-wrap"><table><thead><tr><th>ESP</th><th>Build</th><th>BIN</th><th>SHA</th><th>Code</th><th>State</th><th>CHECK</th><th>Download start</th><th>Download finish</th><th>Token expires</th><th>Error</th></tr></thead><tbody>{firmware_rows}</tbody></table></div>
 '''
