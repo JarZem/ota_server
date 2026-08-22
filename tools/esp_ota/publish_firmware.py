@@ -1,205 +1,47 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-
-import argparse
-import base64
-import hashlib
-import json
-import ssl
-import subprocess
-import urllib.error
-import urllib.request
+import argparse,base64,hashlib,json,re,ssl,subprocess,urllib.error,urllib.request
 from pathlib import Path
-
-from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives import hashes,serialization
 from cryptography.hazmat.primitives.asymmetric import ec
-
-PUBLISH_DOMAIN = b'JaroslavZemanESP|firmware-publish-v1|'
-Z2M_PUBLISH_DOMAIN = b'JaroslavZemanESP|z2m-publish-v1|'
-
-
-def b64url(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).decode('ascii').rstrip('=')
-
-
-def sha256(path: Path) -> str:
-    h = hashlib.sha256()
-    with path.open('rb') as f:
-        for block in iter(lambda: f.read(1024 * 1024), b''):
-            h.update(block)
-    return h.hexdigest()
-
-
-def detected_version(project: Path, build: Path) -> str:
-    description = build / 'project_description.json'
-    if description.is_file():
-        try:
-            value = str(json.loads(description.read_text(encoding='utf-8')).get('project_version') or '').strip()
-            if value:
-                return value
-        except Exception:
-            pass
-    try:
-        return subprocess.check_output(
-            ['git', '-C', str(project), 'describe', '--tags', '--always', '--dirty'],
-            text=True, stderr=subprocess.DEVNULL, timeout=5,
-        ).strip()
-    except Exception:
-        return 'unknown'
-
-
-def post_json(request: urllib.request.Request, context: ssl.SSLContext, label: str) -> dict:
-    try:
-        with urllib.request.urlopen(request, timeout=120, context=context) as response:
-            return json.loads(response.read().decode('utf-8'))
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode('utf-8', errors='replace')
-        raise SystemExit(f'{label} rejected HTTP {exc.code}: {detail}') from exc
-    except Exception as exc:
-        raise SystemExit(f'{label} failed: {exc}') from exc
-
-
-def publish_zigbee2mqtt_bundle(
-    ota_url: str,
-    project_name: str,
-    build: Path,
-    certificate_path: Path,
-    private_key: ec.EllipticCurvePrivateKey,
-    context: ssl.SSLContext,
-) -> None:
-    bundle_dir = build / 'zigbee2mqtt'
-    expected = [
-        bundle_dir / f'{project_name}.mjs',
-        bundle_dir / f'{project_name}.project.mjs',
-        bundle_dir / f'{project_name}.ota.mjs',
-    ]
-    missing = [str(path) for path in expected if not path.is_file()]
-    if missing:
-        raise SystemExit('Zigbee2MQTT build bundle is incomplete: ' + ', '.join(missing))
-
-    digest = hashlib.sha256()
-    files: dict[str, str] = {}
-    for path in sorted(expected, key=lambda p: p.name):
-        data = path.read_bytes()
-        digest.update(path.name.encode('utf-8'))
-        digest.update(b'\0')
-        digest.update(data)
-        digest.update(b'\0')
-        files[path.name] = base64.b64encode(data).decode('ascii')
-    digest_hex = digest.hexdigest()
-
-    canonical = Z2M_PUBLISH_DOMAIN + project_name.encode('utf-8') + b'|' + digest_hex.encode('ascii')
-    signature = private_key.sign(canonical, ec.ECDSA(hashes.SHA256()))
-    body = json.dumps({
-        'schema': 1,
-        'project': project_name,
-        'files': files,
-        'certificate': b64url(certificate_path.read_bytes()),
-        'signature': b64url(signature),
-    }, separators=(',', ':')).encode('utf-8')
-
-    request = urllib.request.Request(
-        ota_url + '/api/zigbee2mqtt/publish',
-        data=body,
-        headers={'Content-Type': 'application/json'},
-        method='POST',
-    )
-    result = post_json(request, context, 'Zigbee2MQTT converter publish')
-    if result.get('status') != 'PUBLISHED':
-        raise SystemExit(f'Zigbee2MQTT converter publish rejected: {result}')
-    print(
-        f"JarZem OTA Zigbee2MQTT converter published: project={project_name} "
-        f"changed={int(bool(result.get('changed')))}"
-    )
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description='Publish a successful ESP-IDF build to the JarZem OTA server.')
-    parser.add_argument('--project', type=Path, required=True)
-    parser.add_argument('--build', type=Path, required=True)
-    parser.add_argument('--project-name', required=True)
-    args = parser.parse_args()
-
-    project = args.project.resolve()
-    build = args.build.resolve()
-    config_path = project / '.jarzem_ota' / 'project.json'
-    if not config_path.is_file():
-        raise SystemExit('JarZem OTA project manifest is missing; build output will not be published.')
-    config = json.loads(config_path.read_text(encoding='utf-8'))
-
-    bin_path = build / f'{args.project_name}.bin'
-    if not bin_path.is_file():
-        raise SystemExit(f'ESP-IDF application binary not found: {bin_path}')
-
-    credentials = project / 'device_credentials'
-    private_key_path = credentials / 'device_private.pem'
-    certificate_path = credentials / 'device_cert.pem'
-    root_ca_path = credentials / 'root_ca_cert.pem'
-    for path in (private_key_path, certificate_path, root_ca_path):
-        if not path.is_file():
-            raise SystemExit(f'Installed device identity is incomplete: {path}')
-
-    metadata = dict(config.get('firmware') or {})
-    metadata['firmware_version'] = detected_version(project, build)
-    required = (
-        'ota_ecosystem', 'device_model', 'product_role', 'firmware_product',
-        'hardware_revision', 'chip_family', 'flash_size', 'firmware_channel',
-        'firmware_version',
-    )
-    missing = [key for key in required if not str(metadata.get(key) or '').strip()]
-    if missing:
-        raise SystemExit('Firmware publish metadata missing: ' + ', '.join(missing))
-    metadata.setdefault('secure_version', 0)
-    metadata.setdefault('active', True)
-
-    firmware_filename = str(config.get('firmware_filename') or f"{metadata['firmware_product']}.bin")
-    digest = sha256(bin_path)
-    metadata_bytes = json.dumps(metadata, separators=(',', ':'), sort_keys=True).encode('utf-8')
-    metadata_b64 = b64url(metadata_bytes)
-    canonical = (
-        PUBLISH_DOMAIN
-        + firmware_filename.encode('utf-8') + b'|'
-        + digest.encode('ascii') + b'|'
-        + metadata_b64.encode('ascii')
-    )
-
-    private_key = serialization.load_pem_private_key(private_key_path.read_bytes(), password=None)
-    if not isinstance(private_key, ec.EllipticCurvePrivateKey):
-        raise SystemExit('Installed device private key is not EC.')
-    signature = private_key.sign(canonical, ec.ECDSA(hashes.SHA256()))
-
-    ota_url = str(config.get('publish_url') or '').rstrip('/')
-    if not ota_url:
-        raise SystemExit('publish_url is missing in .jarzem_ota/project.json')
-    context = ssl.create_default_context(cafile=str(root_ca_path))
-
-    request = urllib.request.Request(
-        ota_url + '/api/firmware/publish',
-        data=bin_path.read_bytes(),
-        headers={
-            'Content-Type': 'application/octet-stream',
-            'X-Firmware-Filename': firmware_filename,
-            'X-Firmware-SHA256': digest,
-            'X-Firmware-Metadata': metadata_b64,
-            'X-Publisher-Certificate': b64url(certificate_path.read_bytes()),
-            'X-Publisher-Signature': b64url(signature),
-        },
-        method='POST',
-    )
-    result = post_json(request, context, 'Firmware publish')
-    if result.get('status') != 'PUBLISHED':
-        raise SystemExit(f'Firmware publish rejected: {result}')
-    print(f"JarZem OTA firmware published: {firmware_filename} version={metadata['firmware_version']} sha256={digest[:12]}")
-
-    publish_zigbee2mqtt_bundle(
-        ota_url,
-        args.project_name,
-        build,
-        certificate_path,
-        private_key,
-        context,
-    )
-
-
-if __name__ == '__main__':
-    main()
+PUBLISH_DOMAIN=b'JaroslavZemanESP|firmware-publish-v1|'; Z2M_PUBLISH_DOMAIN=b'JaroslavZemanESP|z2m-publish-v1|'
+def b64url(d): return base64.urlsafe_b64encode(d).decode().rstrip('=')
+def sha256(p): return hashlib.sha256(p.read_bytes()).hexdigest()
+def detected_version(project,build):
+ d=build/'project_description.json'
+ if d.is_file():
+  try:
+   v=str(json.loads(d.read_text()).get('project_version') or '').strip()
+   if v:return v
+  except Exception:pass
+ try:return subprocess.check_output(['git','-C',str(project),'describe','--tags','--always','--dirty'],text=True,stderr=subprocess.DEVNULL,timeout=5).strip()
+ except Exception:return 'unknown'
+def post(req,ctx,label):
+ try:
+  with urllib.request.urlopen(req,timeout=120,context=ctx) as r:return json.loads(r.read())
+ except urllib.error.HTTPError as e:raise SystemExit(f'{label} rejected HTTP {e.code}: {e.read().decode(errors="replace")}')
+ except Exception as e:raise SystemExit(f'{label} failed: {e}')
+def publish_z2m(url,name,build,version,cert,key,ctx):
+ p=build/'zigbee2mqtt'/f'{name}.mjs'
+ if not p.is_file():raise SystemExit(f'Generated Zigbee2MQTT converter missing: {p}')
+ data=p.read_bytes(); m=re.search(rb'^// JarZem firmware build: (.+)$',data,re.M); cv=m.group(1).decode().strip() if m else 'missing'
+ if cv!=version:raise SystemExit(f'Converter/firmware build mismatch: converter={cv} firmware={version}')
+ digest=hashlib.sha256(p.name.encode()+b'\0'+data+b'\0').hexdigest(); canonical=Z2M_PUBLISH_DOMAIN+name.encode()+b'|'+digest.encode(); sig=key.sign(canonical,ec.ECDSA(hashes.SHA256()))
+ body=json.dumps({'schema':2,'project':name,'firmware_version':version,'files':{p.name:base64.b64encode(data).decode()},'certificate':b64url(cert.read_bytes()),'signature':b64url(sig)},separators=(',',':')).encode()
+ result=post(urllib.request.Request(url+'/api/zigbee2mqtt/publish',data=body,headers={'Content-Type':'application/json'},method='POST'),ctx,'Zigbee2MQTT converter publish')
+ if result.get('status')!='PUBLISHED':raise SystemExit(f'Zigbee2MQTT converter publish rejected: {result}')
+ print(f'JarZem OTA Zigbee2MQTT converter published: project={name} build={version} changed={int(bool(result.get("changed")))}')
+def main():
+ a=argparse.ArgumentParser();a.add_argument('--project',type=Path,required=True);a.add_argument('--build',type=Path,required=True);a.add_argument('--project-name',required=True);x=a.parse_args();project=x.project.resolve();build=x.build.resolve();cp=project/'.jarzem_ota'/'project.json'
+ if not cp.is_file():raise SystemExit('JarZem OTA project manifest is missing; build output will not be published.')
+ c=json.loads(cp.read_text());binp=build/f'{x.project_name}.bin'; creds=project/'device_credentials';keyp=creds/'device_private.pem';cert=creds/'device_cert.pem';ca=creds/'root_ca_cert.pem'
+ for p in (binp,keyp,cert,ca):
+  if not p.is_file():raise SystemExit(f'Required publish file missing: {p}')
+ meta=dict(c.get('firmware') or {});meta['firmware_version']=detected_version(project,build);required=('ota_ecosystem','device_model','product_role','firmware_product','hardware_revision','chip_family','flash_size','firmware_channel','firmware_version');missing=[k for k in required if not str(meta.get(k) or '').strip()]
+ if missing:raise SystemExit('Firmware publish metadata missing: '+', '.join(missing))
+ meta.setdefault('secure_version',0);meta.setdefault('active',True);fn=str(c.get('firmware_filename') or f"{meta['firmware_product']}.bin");digest=sha256(binp);mb=b64url(json.dumps(meta,separators=(',',':'),sort_keys=True).encode());canonical=PUBLISH_DOMAIN+fn.encode()+b'|'+digest.encode()+b'|'+mb.encode();key=serialization.load_pem_private_key(keyp.read_bytes(),password=None)
+ if not isinstance(key,ec.EllipticCurvePrivateKey):raise SystemExit('Installed device private key is not EC.')
+ sig=key.sign(canonical,ec.ECDSA(hashes.SHA256()));url=str(c.get('publish_url') or '').rstrip('/');ctx=ssl.create_default_context(cafile=str(ca));headers={'Content-Type':'application/octet-stream','X-Firmware-Filename':fn,'X-Firmware-SHA256':digest,'X-Firmware-Metadata':mb,'X-Publisher-Certificate':b64url(cert.read_bytes()),'X-Publisher-Signature':b64url(sig)};result=post(urllib.request.Request(url+'/api/firmware/publish',data=binp.read_bytes(),headers=headers,method='POST'),ctx,'Firmware publish')
+ if result.get('status')!='PUBLISHED':raise SystemExit(f'Firmware publish rejected: {result}')
+ print(f'JarZem OTA firmware published: {fn} version={meta["firmware_version"]} sha256={digest[:12]}');publish_z2m(url,x.project_name,build,meta['firmware_version'],cert,key,ctx)
+if __name__=='__main__':main()
