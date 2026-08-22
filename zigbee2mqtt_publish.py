@@ -73,6 +73,34 @@ def _restart_zigbee2mqtt() -> None:
         response.read()
 
 
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _write_verified(target: Path, data: bytes) -> tuple[bool, str]:
+    old = target.read_bytes() if target.is_file() else None
+    changed = old != data
+
+    fd, temp_name = tempfile.mkstemp(prefix='.' + target.name + '.', dir=target.parent)
+    try:
+        with os.fdopen(fd, 'wb') as out:
+            out.write(data)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(temp_name, target)
+    except Exception:
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
+        raise
+
+    actual = target.read_bytes()
+    if actual != data:
+        raise ValueError(f'zigbee2mqtt_deploy_verify_failed:{target.name}')
+    return changed, _sha256_bytes(actual)
+
+
 def handle_zigbee2mqtt_publish(handler) -> None:
     try:
         try:
@@ -131,24 +159,23 @@ def handle_zigbee2mqtt_publish(handler) -> None:
         target_dir.mkdir(parents=True, exist_ok=True)
 
         changed = False
-        for filename, data in normalized.items():
+        deployed = {}
+        for filename in sorted(normalized):
             target = target_dir / filename
-            if target.is_file() and target.read_bytes() == data:
-                continue
-            fd, temp_name = tempfile.mkstemp(prefix='.' + filename + '.', dir=target_dir)
-            try:
-                with os.fdopen(fd, 'wb') as out:
-                    out.write(data)
-                    out.flush()
-                    os.fsync(out.fileno())
-                os.replace(temp_name, target)
-            except Exception:
-                try:
-                    os.unlink(temp_name)
-                except OSError:
-                    pass
-                raise
-            changed = True
+            file_changed, file_sha = _write_verified(target, normalized[filename])
+            changed = changed or file_changed
+            deployed[filename] = file_sha
+            print(
+                f'Zigbee2MQTT converter deployed file={filename} changed={int(file_changed)} '
+                f'sha256={file_sha[:12]} bytes={len(normalized[filename])}',
+                flush=True,
+            )
+
+        wrapper = target_dir / f'{project}.mjs'
+        wrapper_text = wrapper.read_text(encoding='utf-8', errors='replace')
+        expected_import = f"import projectDefinition from './{project}.project.mjs';"
+        if expected_import not in wrapper_text or f"import * as ota from './{project}.ota.mjs';" not in wrapper_text:
+            raise ValueError('zigbee2mqtt_wrapper_verify_failed')
 
         if changed:
             _restart_zigbee2mqtt()
@@ -163,6 +190,7 @@ def handle_zigbee2mqtt_publish(handler) -> None:
             'project': project,
             'changed': changed,
             'directory': str(target_dir),
+            'files': deployed,
         })
     except Exception as exc:
         print(f'Zigbee2MQTT converter publish rejected: {exc}', flush=True)
