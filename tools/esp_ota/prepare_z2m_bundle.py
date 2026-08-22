@@ -47,10 +47,15 @@ def _remove_imports(text: str) -> str:
 
 
 def _make_monolith(project_text: str, ota_text: str, version: str) -> str:
-    # The project converter contract intentionally uses exposes alias `e`.
-    # OTA owns the common imports so the deployed file has no local imports.
+    # Both source converters are deliberately wrapped in separate lexical scopes.
+    # They may therefore use the same private helper names (delay, clamp, etc.)
+    # without ever colliding in the generated single-file converter.
     project_body = _remove_imports(project_text)
-    project_body, count = re.subn(r'export\s+default\s+definition\s*;', 'const projectDefinition=definition;', project_body)
+    project_body, count = re.subn(
+        r'export\s+default\s+definition\s*;',
+        'return definition;',
+        project_body,
+    )
     if count != 1:
         raise SystemExit('Project converter must end with `export default definition;`')
 
@@ -61,24 +66,42 @@ def _make_monolith(project_text: str, ota_text: str, version: str) -> str:
 import * as m from 'zigbee-herdsman-converters/lib/modernExtend';
 import {Zcl} from 'zigbee-herdsman';
 """
+
+    project_scope = f"""
+const projectDefinition=(()=>{{
+{project_body.strip()}
+}})();
+"""
+
+    ota_scope = f"""
+const jarzemOta=(()=>{{
+{ota_body.strip()}
+return {{extend,fromZigbee,toZigbee,exposes,endpointMap,configure}};
+}})();
+"""
+
     glue = """
 const jarzemOtaAugment=(definition)=>({
     ...definition,
-    extend:[...(definition.extend??[]),...extend],
-    fromZigbee:[...(definition.fromZigbee??[]),...fromZigbee],
-    toZigbee:[...(definition.toZigbee??[]),...toZigbee],
-    exposes:[...(definition.exposes??[]),...exposes],
-    endpoint:(device)=>({...(typeof definition.endpoint==='function'?definition.endpoint(device):{}),...endpointMap}),
+    extend:[...(definition.extend??[]),...jarzemOta.extend],
+    fromZigbee:[...(definition.fromZigbee??[]),...jarzemOta.fromZigbee],
+    toZigbee:[...(definition.toZigbee??[]),...jarzemOta.toZigbee],
+    exposes:[...(definition.exposes??[]),...jarzemOta.exposes],
+    endpoint:(device)=>({...(typeof definition.endpoint==='function'?definition.endpoint(device):{}),...jarzemOta.endpointMap}),
     configure:async(device,coordinatorEndpoint,logger)=>{
         if(definition.configure)await definition.configure(device,coordinatorEndpoint,logger);
-        await configure(device,coordinatorEndpoint,logger);
+        await jarzemOta.configure(device,coordinatorEndpoint,logger);
     },
     meta:{...(definition.meta??{}),multiEndpoint:true},
 });
 
 export default Array.isArray(projectDefinition)?projectDefinition.map(jarzemOtaAugment):jarzemOtaAugment(projectDefinition);
 """
-    return f'// JarZem firmware build: {version}\n// Generated file: project converter + JarZem Secure OTA; do not edit in Home Assistant.\n{imports}\n{project_body.strip()}\n\n{ota_body.strip()}\n{glue}'
+    return (
+        f'// JarZem firmware build: {version}\n'
+        '// Generated file: project converter + JarZem Secure OTA; do not edit in Home Assistant.\n'
+        f'{imports}\n{project_scope}\n{ota_scope}\n{glue}'
+    )
 
 
 def main() -> None:
@@ -119,10 +142,13 @@ def main() -> None:
         raise SystemExit('Generated converter unexpectedly contains legacy OTA endpoint suffixes')
     if f'// JarZem firmware build: {version}' not in generated:
         raise SystemExit('Generated converter build marker missing')
+    if 'const projectDefinition=(()=>{' not in generated or 'const jarzemOta=(()=>{' not in generated:
+        raise SystemExit('Generated converter lexical scope isolation missing')
 
     print(f'Zigbee2MQTT converter ready: {target}')
     print(f'  firmware build: {version}')
     print('  single-file deployment: yes')
+    print('  project/OTA lexical scope isolation: yes')
     print('  OTA HA entities: enable_ota, ota_status (no endpoint suffix)')
 
 
