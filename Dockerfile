@@ -2,25 +2,17 @@ FROM python:3.13-alpine
 
 RUN pip install --no-cache-dir esptool websocket-client cryptography paho-mqtt SQLAlchemy PyMySQL alembic
 
-COPY run.sh /
-COPY ota_helper.py /
-COPY device_enrollment.py /
-COPY database.py /
-COPY device_registry.py /
-COPY manufacturing_api.py /
-COPY migrate_legacy_sqlite.py /
-COPY server.py /
-COPY server_mysql.py /
-COPY firmware_publish.py /
-COPY zigbee2mqtt_publish.py /
-COPY mqtt_listener.py /
-COPY secure_transport.py /
-COPY ota_check_security.py /
-COPY ota_check_runtime.py /
-COPY ota_tool.py /usr/local/bin/ota-tool
-COPY alembic.ini /
-COPY migrations /migrations
+# The image contains only a seed copy. At runtime bootstrap.sh mirrors the
+# managed scripts to /share/ota_server/runtime and OTA executes them there.
+# /share is persistent and visible outside the add-on container.
+RUN mkdir -p /opt/ota_server_seed
+COPY *.py /opt/ota_server_seed/
+COPY alembic.ini /opt/ota_server_seed/alembic.ini
+COPY migrations /opt/ota_server_seed/migrations
+COPY run.sh /opt/ota_server_seed/run.sh
+COPY restart.sh /opt/ota_server_seed/restart.sh
+COPY bootstrap.sh /bootstrap.sh
 
-RUN chmod a+x /run.sh /usr/local/bin/ota-tool
+RUN chmod a+x /bootstrap.sh /opt/ota_server_seed/run.sh /opt/ota_server_seed/restart.sh /opt/ota_server_seed/ota_tool.py
 
-CMD ["/run.sh"]
+CMD ["/bootstrap.sh"]
