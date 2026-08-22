@@ -9,10 +9,16 @@ RUN mkdir -p /opt/ota_server_seed
 COPY *.py /opt/ota_server_seed/
 COPY alembic.ini /opt/ota_server_seed/alembic.ini
 COPY migrations /opt/ota_server_seed/migrations
+COPY tests /opt/ota_server_seed/tests
 COPY run.sh /opt/ota_server_seed/run.sh
 COPY restart.sh /opt/ota_server_seed/restart.sh
 COPY bootstrap.sh /bootstrap.sh
 
-RUN chmod a+x /bootstrap.sh /opt/ota_server_seed/run.sh /opt/ota_server_seed/restart.sh /opt/ota_server_seed/ota_tool.py
+RUN chmod a+x /bootstrap.sh \
+    /opt/ota_server_seed/run.sh \
+    /opt/ota_server_seed/restart.sh \
+    /opt/ota_server_seed/ota_tool.py \
+    /opt/ota_server_seed/tests/run_ota_e2e_live.py \
+    /opt/ota_server_seed/tests/test_ota_e2e_live.py
 
 CMD ["/bootstrap.sh"]
