@@ -4,7 +4,7 @@ OTA runtime uses the existing Home Assistant MariaDB/MySQL service. SQLite is no
 
 ## Connection configuration
 
-Home Assistant add-on options contain only non-secret connection settings:
+Home Assistant add-on options contain non-secret connection settings:
 
 ```yaml
 mysql_host: core-mariadb
@@ -14,65 +14,44 @@ mysql_username: homeassistant
 mysql_password_secret: homeassistant_mysql
 ```
 
-The password is deliberately not stored in Git or `config.yaml`. It is resolved from:
-
-```text
-/share/ota_server/secrets.json
-```
-
-Example structure:
+Passwords are resolved from `/share/ota_server/secrets.json`, for example:
 
 ```json
 {
-  "wifi_passwords": {
-    "main_wifi": "..."
-  },
-  "database_passwords": {
-    "homeassistant_mysql": "..."
-  }
+  "wifi_passwords": {"main_wifi": "..."},
+  "database_passwords": {"homeassistant_mysql": "..."}
 }
 ```
 
-`OTA_MYSQL_PASSWORD` can override the password for tests or non-HA deployments.
+`OTA_MYSQL_PASSWORD` can override the DB password for tests/non-HA deployments.
 
 ## Schema management
 
-DDL is owned exclusively by Alembic. Application Python modules must not execute `CREATE TABLE`, `ALTER TABLE` or schema migrations.
+DDL is owned exclusively by Alembic. Runtime modules do not create or alter tables.
 
-At add-on startup `run.sh` executes:
+Startup runs:
 
 ```bash
-alembic -c /alembic.ini upgrade head
+alembic -c /share/ota_server/runtime/alembic.ini upgrade head
 ```
 
-Only after Alembic completes are application services started. The Alembic version table is deliberately namespaced:
+The namespaced version table is:
 
 ```text
 ota_server_alembic_version
 ```
 
-This avoids collisions with another application using Alembic in the shared `homeassistant` database.
-
-## One-time migration from SQLite
-
-Immediately after the first successful Alembic migration, `migrate_legacy_sqlite.py` looks for the previous runtime databases:
+Current expected revision:
 
 ```text
-/data/ota_server.db
-/data/device_registry.db
+0003_ota_observability
 ```
 
-If found, their existing rows are copied into the corresponding MySQL tables. Only after a successful import is each legacy database renamed to:
+## One-time SQLite migration
 
-```text
-*.db.migrated
-```
+`migrate_legacy_sqlite.py` can import old `/data/ota_server.db` and `/data/device_registry.db`. Successfully migrated files are renamed to `*.db.migrated`; they are never used as active runtime databases afterward.
 
-On subsequent starts there is therefore no active SQLite database to read or write.
-
-## Table names
-
-All OTA tables are namespaced in the shared database:
+## Core tables
 
 ```text
 ota_server_firmware_images
@@ -83,17 +62,120 @@ ota_server_device_provisioning
 ota_server_devices
 ota_server_command_counters
 ota_server_device_certificates
+ota_server_download_grants
 ```
 
-Application code accesses them through `database.py`; logical legacy names are translated centrally so SQL dialect/configuration details are not spread through the server.
+`ota_server_device_certificates` stores only public device identity material and successful provisioning security context. Device private keys are never stored in MySQL.
 
-## Responsibilities
+`ota_server_download_grants` stores short-lived OTA CHECK/download grants, their expiry and consumption state.
 
-- `migrations/`: database structure and future schema changes.
-- `database.py`: MySQL configuration, SQLAlchemy engine, transactions and runtime SQL adaptation.
-- `migrate_legacy_sqlite.py`: one-time legacy data import only.
-- `device_registry.py`: device certificate SELECT/INSERT/UPDATE only.
-- `manufacturing_api.py`: HTTP API only; never creates tables.
-- `server_mysql.py`: activates the MySQL database layer for the existing OTA application.
+## Build artifact audit
 
-When schema changes are needed, create a new Alembic revision. Do not add runtime `CREATE TABLE IF NOT EXISTS` logic to application modules.
+```text
+ota_server_artifact_publications
+```
+
+One row binds a firmware build publication to its publisher ESP certificate. It stores:
+
+```text
+firmware_version
+firmware_filename / firmware_sha256 / firmware_size
+converter_project / converter_filename / converter_sha256
+publisher_device_id
+publisher_certificate_fingerprint
+bin_verified
+mjs_verified
+z2m_loaded
+published_at / converter_published_at
+last_error
+```
+
+The MJS publish is accepted only after a verified BIN of the same build from the same publisher exists.
+
+## Provisioning attempt history
+
+```text
+ota_server_provisioning_attempts
+```
+
+Unique key:
+
+```text
+(device_id, counter)
+```
+
+It preserves the timeline of one provisioning attempt:
+
+```text
+started_at
+challenge_sent_at
+response_verified_at
+provisioning_sent_at
+completed_at
+state
+error
+```
+
+The passive MQTT observer records transport observations. `response_verified_at` is set only when OTA emits `P`, because the authoritative state machine emits `P` only after successful R verification.
+
+## ESP × firmware cross table
+
+```text
+ota_server_device_firmware_status
+```
+
+Primary key:
+
+```text
+(device_id, firmware_sha256)
+```
+
+This table answers the operational question "what happened when this exact ESP was offered this exact BIN?" It stores:
+
+```text
+firmware_filename
+firmware_version
+firmware_code
+state
+check_created_at
+check_sent_at
+token_expires_at
+download_started_at
+download_finished_at
+download_failed_at
+grant_consumed_at
+last_error
+updated_at
+```
+
+Typical state progression is:
+
+```text
+CHECK_SENT
+DOWNLOAD_STARTED
+DOWNLOAD_COMPLETED
+DEVICE_CONFIRMED
+```
+
+or on failure:
+
+```text
+CHECK_SENT
+DOWNLOAD_STARTED
+DOWNLOAD_FAILED
+```
+
+Timestamps are intentionally retained even when the current state advances, so the ingress UI can show both start and finish times.
+
+## Code responsibilities
+
+- `migrations/`: schema ownership.
+- `database.py`: MySQL configuration, SQLAlchemy engine and logical table mapping.
+- `activity.py`: writes/reads operational lifecycle tables and renders ingress status tables.
+- `mqtt_observer.py`: passive persistence of Zigbee2MQTT OTA/provisioning traffic.
+- `device_registry.py`: Root-CA-validated public device identities.
+- `firmware_publish.py`: signed BIN validation plus artifact audit.
+- `zigbee2mqtt_publish.py`: signed MJS validation, BIN/MJS binding and Z2M runtime verification.
+- `server_mysql.py`: HTTPS download telemetry and ingress integration.
+
+When schema changes are needed, create a new Alembic revision and update `EXPECTED_SCHEMA_REVISION`. Do not add runtime `CREATE TABLE IF NOT EXISTS` logic.
