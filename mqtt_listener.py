@@ -11,8 +11,9 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 
+from activity import firmware_device_state
 from device_registry import accept_hello_counter, get_registered_device, normalize_device_id
-from ota_check_security import consume_download_grant_b64, save_provisioning_context
+from ota_check_security import confirm_completed_download_b64, save_provisioning_context
 from secure_transport import build_challenge, build_provisioning, verify_response
 
 OPTIONS_PATH = "/data/options.json"
@@ -161,9 +162,6 @@ def session_timeout_loop():
 def extract_protocol_payload(message, base_topic):
     parts = message.topic.split("/")
 
-    # Compatibility with converters deployed before ota_transport was hidden
-    # from Home Assistant. Remove this branch only after all installations have
-    # migrated away from /action.
     if len(parts) == 3 and parts[0] == base_topic and parts[2] == "action":
         try:
             payload = message.payload.decode("utf-8").strip()
@@ -171,8 +169,6 @@ def extract_protocol_payload(message, base_topic):
             return None, None
         return parts[1], payload
 
-    # Current transport: converter publishes an unexposed ota_transport field
-    # on the normal Zigbee2MQTT device state topic. HA never discovers it.
     if len(parts) == 2 and parts[0] == base_topic:
         try:
             state = json.loads(message.payload.decode("utf-8"))
@@ -262,10 +258,22 @@ def build_client(base_topic, expected_ecosystem, options):
             if len(parts) != 2 or not parts[1]:
                 log_error(f"F completion malformed device_id={device_id}")
                 return
-            if consume_download_grant_b64(device_id, parts[1]):
-                log_verify(f"OTA download grant consumed device_id={device_id} random={parts[1]}")
-            else:
-                log_error(f"OTA download completion rejected/expired/already-consumed device_id={device_id}")
+            completed = confirm_completed_download_b64(device_id, parts[1])
+            if not completed:
+                log_error(f"OTA firmware confirmation rejected device_id={device_id}; no matching completed HTTPS transfer")
+                return
+            firmware_device_state(
+                device_id=device_id,
+                sha256=completed["sha256"],
+                filename=completed["firmware_filename"],
+                version=completed["version"],
+                code=completed["code"],
+                state="DEVICE_CONFIRMED",
+            )
+            log_verify(
+                f"OTA firmware confirmed by ESP device_id={device_id} filename={completed['firmware_filename']} "
+                f"sha256={completed['sha256'][:12]} random={parts[1]}"
+            )
             return
 
         if payload.startswith("R|"):
@@ -301,9 +309,6 @@ def build_client(base_topic, expected_ecosystem, options):
                         pending_sessions.pop(device_id, None)
             return
 
-        # H starts a new attempt. Verification happens before touching an existing
-        # session. A stale/equal counter is therefore harmless and ignored. A
-        # valid higher counter explicitly replaces any unfinished attempt.
         log_zigbee(f"RX H <- device_id={device_id} bytes={len(payload)}")
         try:
             hello = verify_single_hello(payload, topic_device, expected_ecosystem)
