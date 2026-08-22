@@ -47,7 +47,7 @@ const decodeOtaControlUplink=(payload)=>{
 
 const b64urlDecode=(s)=>Buffer.from(s.replace(/-/g,'+').replace(/_/g,'/')+'='.repeat((4-s.length%4)%4),'base64');
 const delay=(ms)=>new Promise((resolve)=>setTimeout(resolve,ms));
-const otaControlEndpoint=(entity,meta)=>meta?.device?.getEndpoint(OTA_CONTROL_ENDPOINT)??(entity?.ID===OTA_CONTROL_ENDPOINT?entity:undefined);
+const otaControlEndpoint=(entity,meta)=>entity?.ID===OTA_CONTROL_ENDPOINT?entity:(meta?.device?.getEndpoint(OTA_CONTROL_ENDPOINT));
 
 const validateOtaCommand=(value)=>{
     if(typeof value!=='string')throw new Error('OTA command must be a string');
@@ -105,14 +105,18 @@ const fromRaw={cluster:OTA_CLUSTER_NAME,type:['raw'],convert:(model,msg,publish,
     }
 }};
 
-const fromEnable={cluster:OTA_ENABLE_CLUSTER_NAME,type:['attributeReport','readResponse'],convert:(model,msg)=>{
+const fromEnable={cluster:OTA_ENABLE_CLUSTER_NAME,type:['attributeReport','readResponse'],convert:(model,msg,publish,options,meta)=>{
     if(msg.endpoint.ID!==OTA_CONTROL_ENDPOINT||msg.data?.[OTA_ENABLE_ATTR_NAME]===undefined)return;
-    return{enable_ota:msg.data[OTA_ENABLE_ATTR_NAME]?'ON':'OFF'};
+    const state=msg.data[OTA_ENABLE_ATTR_NAME]?'ON':'OFF';
+    meta?.logger?.info?.(`[OTA/CONTROL RX] endpoint=${OTA_CONTROL_ENDPOINT} enable_ota=${state} type=${msg.type}`);
+    return{enable_ota:state};
 }};
 
-const fromStatus={cluster:OTA_STATUS_CLUSTER_NAME,type:['attributeReport','readResponse'],convert:(model,msg)=>{
+const fromStatus={cluster:OTA_STATUS_CLUSTER_NAME,type:['attributeReport','readResponse'],convert:(model,msg,publish,options,meta)=>{
     if(msg.endpoint.ID!==OTA_CONTROL_ENDPOINT||msg.data?.[OTA_STATUS_ATTR_NAME]===undefined)return;
-    return{ota_status:decodeOtaStatus(msg.data[OTA_STATUS_ATTR_NAME])};
+    const state=decodeOtaStatus(msg.data[OTA_STATUS_ATTR_NAME]);
+    meta?.logger?.info?.(`[OTA/CONTROL RX] endpoint=${OTA_CONTROL_ENDPOINT} ota_status=${state} type=${msg.type}`);
+    return{ota_status:state};
 }};
 
 const toCommand={key:['ota_command'],convertSet:async(entity,key,value,meta)=>{
@@ -125,10 +129,11 @@ const toCommand={key:['ota_command'],convertSet:async(entity,key,value,meta)=>{
     return{state:{}};
 }};
 
-const toEnable={key:['enable_ota'],convertSet:async(entity,key,value,meta)=>{
+const toEnable={key:['enable_ota'],endpoints:['ota_control'],convertSet:async(entity,key,value,meta)=>{
     const endpoint=otaControlEndpoint(entity,meta);
     if(!endpoint)throw new Error(`OTA control endpoint ${OTA_CONTROL_ENDPOINT} not found on device; re-interview device`);
     const enabled=String(value).toUpperCase()==='ON'||value===true||value===1;
+    meta?.logger?.info?.(`[OTA/CONTROL TX] endpoint=${endpoint.ID} enable_ota=${enabled?'ON':'OFF'}`);
     await endpoint.write(OTA_ENABLE_CLUSTER_NAME,{[OTA_ENABLE_ATTR_NAME]:enabled},{manufacturerCode:OTA_MANUFACTURER_CODE});
     await delay(OTA_CONTROL_READBACK_DELAY_MS);
     await endpoint.read(OTA_ENABLE_CLUSTER_NAME,[OTA_ENABLE_ATTR_NAME],{manufacturerCode:OTA_MANUFACTURER_CODE});
@@ -137,10 +142,11 @@ const toEnable={key:['enable_ota'],convertSet:async(entity,key,value,meta)=>{
 },convertGet:async(entity,key,meta)=>{
     const endpoint=otaControlEndpoint(entity,meta);
     if(!endpoint)throw new Error(`OTA control endpoint ${OTA_CONTROL_ENDPOINT} not found on device; re-interview device`);
+    meta?.logger?.info?.(`[OTA/CONTROL GET] endpoint=${endpoint.ID} enable_ota`);
     await endpoint.read(OTA_ENABLE_CLUSTER_NAME,[OTA_ENABLE_ATTR_NAME],{manufacturerCode:OTA_MANUFACTURER_CODE});
 }};
 
-const getStatus={key:['ota_status'],convertGet:async(entity,key,meta)=>{
+const getStatus={key:['ota_status'],endpoints:['ota_control'],convertGet:async(entity,key,meta)=>{
     const endpoint=otaControlEndpoint(entity,meta);
     if(!endpoint)throw new Error(`OTA control endpoint ${OTA_CONTROL_ENDPOINT} not found on device; re-interview device`);
     await endpoint.read(OTA_STATUS_CLUSTER_NAME,[OTA_STATUS_ATTR_NAME],{manufacturerCode:OTA_MANUFACTURER_CODE});
@@ -155,10 +161,10 @@ export const extend=[
 export const fromZigbee=[fromCommand,fromRaw,fromEnable,fromStatus];
 export const toZigbee=[toCommand,toEnable,getStatus];
 export const exposes=[
-    e.binary('enable_ota',ea.ALL,'ON','OFF').withDescription('Allow this device to perform a secure OTA firmware update'),
-    e.text('ota_status',ea.STATE_GET),
+    e.binary('enable_ota',ea.ALL,'ON','OFF').withDescription('Allow this device to perform a secure OTA firmware update').withEndpoint('ota_control'),
+    e.text('ota_status',ea.STATE_GET).withEndpoint('ota_control'),
 ];
-export const endpointMap={};
+export const endpointMap={ota_control:OTA_CONTROL_ENDPOINT};
 
 export const configure=async(device,coordinatorEndpoint,logger)=>{
     if(!device.getEndpoint(OTA_ENDPOINT))logger?.warn?.(`JarZem OTA endpoint ${OTA_ENDPOINT} not found`);
@@ -167,6 +173,7 @@ export const configure=async(device,coordinatorEndpoint,logger)=>{
         logger?.warn?.(`JarZem OTA control endpoint ${OTA_CONTROL_ENDPOINT} not found; device interview must be refreshed`);
         return;
     }
+    logger?.info?.(`JarZem OTA control endpoint ${OTA_CONTROL_ENDPOINT} found; reading initial Enable OTA and status`);
     await ctl.read(OTA_ENABLE_CLUSTER_NAME,[OTA_ENABLE_ATTR_NAME],{manufacturerCode:OTA_MANUFACTURER_CODE});
     await ctl.read(OTA_STATUS_CLUSTER_NAME,[OTA_STATUS_ATTR_NAME],{manufacturerCode:OTA_MANUFACTURER_CODE});
 };
