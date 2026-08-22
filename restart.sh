@@ -2,32 +2,64 @@
 set -eu
 
 if [ -z "${SUPERVISOR_TOKEN:-}" ]; then
-    echo "SUPERVISOR_TOKEN is not available; run this script inside the OTA add-on." >&2
+    echo "SUPERVISOR_TOKEN is not available; run this from a Home Assistant add-on shell with Supervisor access." >&2
     exit 1
 fi
 
-echo "Requesting OTA add-on restart through Home Assistant Supervisor..."
-
 python3 - <<'PY'
-import http.client
+import json
 import os
 import urllib.error
 import urllib.request
 
-request = urllib.request.Request(
-    "http://supervisor/addons/self/restart",
-    data=b"",
-    headers={"Authorization": f"Bearer {os.environ['SUPERVISOR_TOKEN']}"},
-    method="POST",
-)
-try:
-    with urllib.request.urlopen(request, timeout=15) as response:
+TOKEN = os.environ["SUPERVISOR_TOKEN"]
+BASE = "http://supervisor"
+HEADERS = {"Authorization": f"Bearer {TOKEN}"}
+
+
+def request_json(path: str, method: str = "GET"):
+    req = urllib.request.Request(
+        BASE + path,
+        data=b"" if method == "POST" else None,
+        headers=HEADERS,
+        method=method,
+    )
+    with urllib.request.urlopen(req, timeout=15) as response:
         body = response.read().decode("utf-8", errors="replace")
-        print(f"Supervisor restart accepted HTTP {response.status}: {body}")
-except http.client.RemoteDisconnected:
-    # The container can disappear before the HTTP response is fully returned.
-    print("Supervisor restart request sent; OTA container is restarting.")
+        return response.status, json.loads(body) if body else {}
+
+
+try:
+    _, payload = request_json("/addons")
+except Exception as exc:
+    raise SystemExit(f"Cannot read Home Assistant add-on list: {exc}") from exc
+
+addons = (payload.get("data") or {}).get("addons") or []
+
+matches = []
+for addon in addons:
+    slug = str(addon.get("slug") or "")
+    name = str(addon.get("name") or "")
+    if slug == "ota_server" or slug.endswith("_ota_server") or name.strip().lower() == "ota server":
+        matches.append((slug, name))
+
+if len(matches) != 1:
+    rendered = ", ".join(f"{slug} ({name})" for slug, name in matches) or "none"
+    raise SystemExit(
+        "Refusing to restart anything: OTA add-on was not identified uniquely. "
+        f"Matches: {rendered}"
+    )
+
+slug, name = matches[0]
+print(f"Restarting only OTA add-on: {name} [{slug}]")
+
+try:
+    status, result = request_json(f"/addons/{slug}/restart", method="POST")
 except urllib.error.HTTPError as exc:
     detail = exc.read().decode("utf-8", errors="replace")
     raise SystemExit(f"OTA restart rejected HTTP {exc.code}: {detail}") from exc
+except Exception as exc:
+    raise SystemExit(f"OTA restart failed: {exc}") from exc
+
+print(f"OTA restart accepted HTTP {status}: {json.dumps(result, ensure_ascii=False)}")
 PY
