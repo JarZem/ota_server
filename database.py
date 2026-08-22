@@ -14,7 +14,7 @@ from sqlalchemy.engine import Engine
 OPTIONS_PATH = Path('/data/options.json')
 SECRETS_PATH = Path('/share/ota_server/secrets.json')
 ALEMBIC_VERSION_TABLE = 'ota_server_alembic_version'
-EXPECTED_SCHEMA_REVISION = '0002_ota_check_session'
+EXPECTED_SCHEMA_REVISION = '0003_ota_observability'
 
 TABLE_MAP = {
     'firmware_images': 'ota_server_firmware_images',
@@ -26,6 +26,9 @@ TABLE_MAP = {
     'command_counters': 'ota_server_command_counters',
     'device_certificates': 'ota_server_device_certificates',
     'download_grants': 'ota_server_download_grants',
+    'artifact_publications': 'ota_server_artifact_publications',
+    'provisioning_attempts': 'ota_server_provisioning_attempts',
+    'device_firmware_status': 'ota_server_device_firmware_status',
 }
 
 _engine: Engine | None = None
