@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import server
+from activity import firmware_device_state, render_ingress_tables
 from database import assert_schema_current, database_summary, db_connect
 from firmware_publish import handle_publish
 from zigbee2mqtt_publish import handle_zigbee2mqtt_publish
@@ -43,12 +44,55 @@ def write_ota_payload_to_zigbee(device, payload):
 
 server.write_ota_payload_to_zigbee = write_ota_payload_to_zigbee
 
+_original_page_html = server.page_html
+
+
+def page_html(message=""):
+    body = _original_page_html(message)
+    try:
+        section = render_ingress_tables()
+    except Exception as exc:
+        section = f'<h3>OTA lifecycle</h3><p class="error">Cannot read OTA lifecycle tables: {server.html.escape(str(exc))}</p>'
+    marker = '<form method="POST" action="send">'
+    return body.replace(marker, section + '\n' + marker, 1)
+
+
+server.page_html = page_html
+
 
 class SecureOTAHandler(server.OTAHandler):
-    """Main OTA HTTPS handler with secure firmware and Zigbee2MQTT publish support."""
+    """Main OTA HTTPS handler with signed publish and persistent download telemetry."""
+
+    activity_device_id = None
+    activity_image = None
+    activity_code = None
+
+    def do_GET(self):
+        parsed = server.urllib.parse.urlparse(self.path)
+        code = server.os.path.basename(parsed.path)
+        image = server.resolve_image_code(code)
+        auth = self.headers.get("Authorization") or ""
+        device_id = self.headers.get("X-Device-ID") or ""
+        if image and auth.startswith("Bearer ") and device_id:
+            token = auth[7:].strip()
+            if validate_dispatch_token(token, code, device_id, image["sha256"]):
+                self.activity_device_id = device_id
+                self.activity_image = image
+                self.activity_code = code
+                firmware_device_state(
+                    device_id=device_id, sha256=image["sha256"], filename=image["filename"],
+                    version=str(image.get("version") or "unknown"), code=code,
+                    state="DOWNLOAD_STARTED",
+                )
+                print(
+                    f"OTA download started device_id={device_id} filename={image['filename']} sha256={image['sha256'][:12]}",
+                    flush=True,
+                )
+        return super().do_GET()
 
     def copyfile(self, source, outputfile):
         completed = False
+        transfer_error = None
         try:
             while True:
                 block = source.read(64 * 1024)
@@ -57,9 +101,25 @@ class SecureOTAHandler(server.OTAHandler):
                 outputfile.write(block)
             outputfile.flush()
             completed = True
-        except (BrokenPipeError, ConnectionResetError):
-            return
+        except (BrokenPipeError, ConnectionResetError) as exc:
+            transfer_error = type(exc).__name__
         finally:
+            image = self.activity_image
+            device_id = self.activity_device_id
+            if image and device_id:
+                if completed:
+                    firmware_device_state(
+                        device_id=device_id, sha256=image["sha256"], filename=image["filename"],
+                        version=str(image.get("version") or "unknown"), code=self.activity_code,
+                        state="DOWNLOAD_COMPLETED",
+                    )
+                elif transfer_error:
+                    firmware_device_state(
+                        device_id=device_id, sha256=image["sha256"], filename=image["filename"],
+                        version=str(image.get("version") or "unknown"), code=self.activity_code,
+                        state="DOWNLOAD_FAILED", error=transfer_error,
+                    )
+
             if completed and self.ota_sha256:
                 auth = self.headers.get("Authorization") or ""
                 device_id = self.headers.get("X-Device-ID") or ""
@@ -75,16 +135,10 @@ class SecureOTAHandler(server.OTAHandler):
     def do_POST(self):
         parsed = server.urllib.parse.urlparse(self.path)
         if parsed.path == '/api/firmware/publish':
-            print(
-                f'Firmware publish request received from {self.client_address[0]}',
-                flush=True,
-            )
+            print(f'Firmware publish request received from {self.client_address[0]}', flush=True)
             return handle_publish(self)
         if parsed.path == '/api/zigbee2mqtt/publish':
-            print(
-                f'Zigbee2MQTT converter publish request received from {self.client_address[0]}',
-                flush=True,
-            )
+            print(f'Zigbee2MQTT converter publish request received from {self.client_address[0]}', flush=True)
             return handle_zigbee2mqtt_publish(self)
         return super().do_POST()
 
@@ -93,12 +147,7 @@ server.OTAHandler = SecureOTAHandler
 
 
 if __name__ == '__main__':
-    print(
-        'Firmware publish HTTPS endpoint active: POST /api/firmware/publish handler=SecureOTAHandler',
-        flush=True,
-    )
-    print(
-        'Zigbee2MQTT publish HTTPS endpoint active: POST /api/zigbee2mqtt/publish',
-        flush=True,
-    )
+    print('Firmware publish HTTPS endpoint active: POST /api/firmware/publish handler=SecureOTAHandler', flush=True)
+    print('Zigbee2MQTT publish HTTPS endpoint active: POST /api/zigbee2mqtt/publish', flush=True)
+    print('Ingress lifecycle tables active: artifacts, provisioning attempts, ESP x firmware state', flush=True)
     server.start_servers()
