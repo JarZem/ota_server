@@ -221,3 +221,37 @@ def consume_download_grant_b64(device_id: str, grant_random_b64: str) -> bool:
     except Exception:
         return False
     return consume_download_grant(device_id, grant_random)
+
+
+def confirm_completed_download_b64(device_id: str, grant_random_b64: str) -> dict | None:
+    """Accept ESP F only after the matching HTTPS grant was already consumed.
+
+    HTTPS completion consumes the one-time grant. F is a later device-side
+    confirmation that the bytes were verified/written; it must not consume the
+    grant for a second time and cannot manufacture a completed transfer.
+    """
+    try:
+        normalized = normalize_device_id(device_id)
+        grant_random = b64u_decode(grant_random_b64)
+    except Exception:
+        return None
+    if len(grant_random) != GRANT_RANDOM_LEN:
+        return None
+
+    with db_connect() as conn:
+        row = conn.execute(
+            """
+            SELECT g.code, g.version, g.sha256, g.consumed_at,
+                   s.firmware_filename, s.state
+            FROM download_grants g
+            JOIN device_firmware_status s
+              ON s.device_id=g.device_id AND s.firmware_sha256=g.sha256
+            WHERE g.device_id=? AND g.grant_random=?
+            ORDER BY g.id DESC
+            LIMIT 1
+            """,
+            (normalized, grant_random),
+        ).fetchone()
+    if not row or not row.get("consumed_at") or row.get("state") != "DOWNLOAD_COMPLETED":
+        return None
+    return dict(row)
