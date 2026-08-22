@@ -1,5 +1,5 @@
 name: "OTA Server"
-version: "0.1.31"
+version: "0.1.32"
 slug: "ota_server"
 description: "OTA server"
 
@@ -43,9 +43,9 @@ options:
   mqtt_base_topic: "zigbee2mqtt"
   mysql_host: "core-mariadb"
   mysql_port: 3306
-  mysql_database: "homeassistant"
-  mysql_username: "homeassistant"
-  mysql_password_secret: "homeassistant_mysql"
+  mysql_database: homeassistant
+  mysql_username: homeassistant
+  mysql_password_secret: homeassistant_mysql
 
 schema:
   ota_ecosystem: str
