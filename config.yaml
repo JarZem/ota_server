@@ -1,5 +1,5 @@
 name: "OTA Server"
-version: "0.1.29"
+version: "0.1.30"
 slug: "ota_server"
 description: "OTA server"
 
@@ -56,7 +56,7 @@ schema:
   ota_host: str
   ota_port: port
   mqtt_host: str
-  mqtt_port: port
+  mqtt_port: int
   mqtt_base_topic: str
   mysql_host: str
   mysql_port: int
