@@ -155,7 +155,7 @@ export const extend=[
 export const fromZigbee=[fromCommand,fromRaw,fromEnable,fromStatus];
 export const toZigbee=[toCommand,toEnable,getStatus];
 export const exposes=[
-    e.binary('enable_ota',ea.ALL,'ON','OFF'),
+    e.binary('enable_ota',ea.ALL,'ON','OFF').withCategory('config').withHomeAssistant({enabledByDefault:true}),
     e.text('ota_status',ea.STATE_GET),
 ];
 export const endpointMap={};
