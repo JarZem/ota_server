@@ -129,7 +129,7 @@ const toCommand={key:['ota_command'],convertSet:async(entity,key,value,meta)=>{
     return{state:{}};
 }};
 
-const toEnable={key:['enable_ota'],endpoints:['ota_control'],convertSet:async(entity,key,value,meta)=>{
+const toEnable={key:['enable_ota'],convertSet:async(entity,key,value,meta)=>{
     const endpoint=otaControlEndpoint(entity,meta);
     if(!endpoint)throw new Error(`OTA control endpoint ${OTA_CONTROL_ENDPOINT} not found on device; re-interview device`);
     const enabled=String(value).toUpperCase()==='ON'||value===true||value===1;
@@ -146,7 +146,7 @@ const toEnable={key:['enable_ota'],endpoints:['ota_control'],convertSet:async(en
     await endpoint.read(OTA_ENABLE_CLUSTER_NAME,[OTA_ENABLE_ATTR_NAME],{manufacturerCode:OTA_MANUFACTURER_CODE});
 }};
 
-const getStatus={key:['ota_status'],endpoints:['ota_control'],convertGet:async(entity,key,meta)=>{
+const getStatus={key:['ota_status'],convertGet:async(entity,key,meta)=>{
     const endpoint=otaControlEndpoint(entity,meta);
     if(!endpoint)throw new Error(`OTA control endpoint ${OTA_CONTROL_ENDPOINT} not found on device; re-interview device`);
     await endpoint.read(OTA_STATUS_CLUSTER_NAME,[OTA_STATUS_ATTR_NAME],{manufacturerCode:OTA_MANUFACTURER_CODE});
@@ -161,8 +161,8 @@ export const extend=[
 export const fromZigbee=[fromCommand,fromRaw,fromEnable,fromStatus];
 export const toZigbee=[toCommand,toEnable,getStatus];
 export const exposes=[
-    e.binary('enable_ota',ea.ALL,'ON','OFF').withDescription('Allow this device to perform a secure OTA firmware update').withEndpoint('ota_control'),
-    e.text('ota_status',ea.STATE_GET).withEndpoint('ota_control'),
+    e.binary('enable_ota',ea.ALL,'ON','OFF').withDescription('Allow this device to perform a secure OTA firmware update'),
+    e.text('ota_status',ea.STATE_GET),
 ];
 export const endpointMap={ota_control:OTA_CONTROL_ENDPOINT};
 
