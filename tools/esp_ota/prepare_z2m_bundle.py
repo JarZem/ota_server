@@ -40,6 +40,10 @@ def _validate_ota_module(path: Path, text: str) -> None:
     missing = [m for m in ('enable_ota', 'ota_status', 'ota_transport') if m not in text]
     if missing:
         raise SystemExit(f'OTA module {path} is incomplete, missing: {", ".join(missing)}')
+    if "e.binary('enable_ota',ea.ALL" not in text:
+        raise SystemExit('OTA module enable_ota must expose STATE+SET+GET access')
+    if 'enabledByDefault:true' not in text:
+        raise SystemExit('OTA module enable_ota must be enabled by default in Home Assistant')
 
 
 def _remove_imports(text: str) -> str:
@@ -47,9 +51,6 @@ def _remove_imports(text: str) -> str:
 
 
 def _make_monolith(project_text: str, ota_text: str, version: str) -> str:
-    # Both source converters are deliberately wrapped in separate lexical scopes.
-    # They may therefore use the same private helper names (delay, clamp, etc.)
-    # without ever colliding in the generated single-file converter.
     project_body = _remove_imports(project_text)
     project_body, count = re.subn(
         r'export\s+default\s+definition\s*;',
@@ -144,12 +145,14 @@ def main() -> None:
         raise SystemExit('Generated converter build marker missing')
     if 'const projectDefinition=(()=>{' not in generated or 'const jarzemOta=(()=>{' not in generated:
         raise SystemExit('Generated converter lexical scope isolation missing')
+    if "e.binary('enable_ota',ea.ALL" not in generated or 'enabledByDefault:true' not in generated:
+        raise SystemExit('Generated converter enable_ota is not writable/default-enabled')
 
     print(f'Zigbee2MQTT converter ready: {target}')
     print(f'  firmware build: {version}')
     print('  single-file deployment: yes')
     print('  project/OTA lexical scope isolation: yes')
-    print('  OTA HA entities: enable_ota, ota_status (no endpoint suffix)')
+    print('  OTA HA enable_ota: STATE+SET+GET, enabledByDefault=yes')
 
 
 if __name__ == '__main__':
