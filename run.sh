@@ -30,14 +30,24 @@ MANUFACTURING_PID=$!
 python3 "$RUNTIME_DIR/mqtt_listener.py" &
 MQTT_PID=$!
 
+python3 "$RUNTIME_DIR/mqtt_observer.py" &
+OBSERVER_PID=$!
+
 sleep 2
 if ! kill -0 "$MQTT_PID" 2>/dev/null; then
     echo "FATAL: mqtt_listener.py terminated during startup" >&2
     wait "$MQTT_PID" || true
-    kill "$MANUFACTURING_PID" 2>/dev/null || true
+    kill "$MANUFACTURING_PID" "$OBSERVER_PID" 2>/dev/null || true
+    exit 1
+fi
+if ! kill -0 "$OBSERVER_PID" 2>/dev/null; then
+    echo "FATAL: mqtt_observer.py terminated during startup" >&2
+    wait "$OBSERVER_PID" || true
+    kill "$MANUFACTURING_PID" "$MQTT_PID" 2>/dev/null || true
     exit 1
 fi
 
 echo "MQTT listener running pid=$MQTT_PID"
+echo "MQTT activity observer running pid=$OBSERVER_PID"
 
 exec python3 "$RUNTIME_DIR/server_mysql.py"
