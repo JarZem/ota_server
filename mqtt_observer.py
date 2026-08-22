@@ -9,7 +9,7 @@ import urllib.request
 
 import paho.mqtt.client as mqtt
 
-from activity import firmware_device_state, provisioning_state
+from activity import firmware_device_state, provisioning_state, record_activity
 from database import db_connect
 from device_registry import normalize_device_id
 
@@ -126,10 +126,6 @@ def _handle(device_id: str, wire: str, direction: str) -> None:
                 firmware_device_state(device_id=device_id, sha256=image['sha256'], filename=image['filename'], version=version, code=code, state='CHECK_SENT', token_expires_at=_grant_expiry(device_id, code, image['sha256']))
         return
 
-    # F is deliberately not persisted here. The observer is passive and cannot
-    # prove that the preceding HTTPS transfer completed. mqtt_listener validates
-    # the grant against DOWNLOAD_COMPLETED and is the sole authority that may
-    # advance the cross-table to DEVICE_CONFIRMED.
     if wire.startswith('F|') and direction == 'ESP_TO_OTA':
         return
 
@@ -162,8 +158,13 @@ def main() -> None:
         device_id = _device_id(topic_device)
         if not device_id: return
         if wire[:2] in ('H|','A|','R|','P|','T|','C|','F|'):
-            try: _handle(device_id, wire, direction)
-            except Exception as exc: print(f'[OTA/OBSERVE] activity write failed device_id={device_id}: {exc}', flush=True)
+            kind = wire[:1]
+            try:
+                record_activity('MQTT', f'{direction} {kind}', device_id=device_id,
+                                detail=f'topic={message.topic} bytes={len(message.payload)}')
+                _handle(device_id, wire, direction)
+            except Exception as exc:
+                print(f'[OTA/OBSERVE] activity write failed device_id={device_id}: {exc}', flush=True)
 
     client.on_connect = on_connect; client.on_message = on_message
     threading.Thread(target=_timeout_loop, daemon=True).start()
