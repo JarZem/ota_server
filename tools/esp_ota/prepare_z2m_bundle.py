@@ -9,12 +9,12 @@ from pathlib import Path
 
 LEGACY_OTA_MARKERS = (
     'enable_ota_ota_control', 'ota_status_ota_control',
-    ".withEndpoint('ota_control')", '.withEndpoint("ota_control")',
 )
 PROJECT_OTA_MARKERS = (
     'jarzemOta', 'OTA_CLUSTER_ID', 'OTA_CONTROL_ENDPOINT',
     'enable_ota', 'ota_status', 'ota_command',
 )
+OTA_MULTI_ENDPOINT_SKIP = ('enable_ota', 'ota_status', 'ota_transport', 'ota_command')
 
 
 def _version(project: Path) -> str:
@@ -42,6 +42,10 @@ def _validate_ota_module(path: Path, text: str) -> None:
         raise SystemExit(f'OTA module {path} is incomplete, missing: {", ".join(missing)}')
     if "e.binary('enable_ota',ea.ALL" not in text:
         raise SystemExit('OTA module enable_ota must expose STATE+SET+GET access')
+    if ".withEndpoint('ota_control')" not in text and '.withEndpoint("ota_control")' not in text:
+        raise SystemExit('OTA module controls must be explicitly bound to endpoint ota_control')
+    if 'endpointMap={ota_control:OTA_CONTROL_ENDPOINT}' not in text:
+        raise SystemExit('OTA module must map ota_control to OTA_CONTROL_ENDPOINT')
     if ".withCategory('config')" in text or '.withCategory("config")' in text:
         raise SystemExit('OTA module enable_ota must be a normal control, not a disabled/config-category HA entity')
 
@@ -81,20 +85,25 @@ return {{extend,fromZigbee,toZigbee,exposes,endpointMap,configure}};
 }})();
 """
 
-    glue = """
-const jarzemOtaAugment=(definition)=>({
+    skip_values = ','.join(repr(v) for v in OTA_MULTI_ENDPOINT_SKIP)
+    glue = f"""
+const jarzemOtaAugment=(definition)=>({{
     ...definition,
     extend:[...(definition.extend??[]),...jarzemOta.extend],
     fromZigbee:[...(definition.fromZigbee??[]),...jarzemOta.fromZigbee],
     toZigbee:[...(definition.toZigbee??[]),...jarzemOta.toZigbee],
     exposes:[...(definition.exposes??[]),...jarzemOta.exposes],
-    endpoint:(device)=>({...(typeof definition.endpoint==='function'?definition.endpoint(device):{}),...jarzemOta.endpointMap}),
-    configure:async(device,coordinatorEndpoint,logger)=>{
+    endpoint:(device)=>({{...(typeof definition.endpoint==='function'?definition.endpoint(device):{{}}),...jarzemOta.endpointMap}}),
+    configure:async(device,coordinatorEndpoint,logger)=>{{
         if(definition.configure)await definition.configure(device,coordinatorEndpoint,logger);
         await jarzemOta.configure(device,coordinatorEndpoint,logger);
-    },
-    meta:{...(definition.meta??{}),multiEndpoint:true},
-});
+    }},
+    meta:{{
+        ...(definition.meta??{{}}),
+        multiEndpoint:true,
+        multiEndpointSkip:[...new Set([...(definition.meta?.multiEndpointSkip??[]),{skip_values}])],
+    }},
+}});
 
 export default Array.isArray(projectDefinition)?projectDefinition.map(jarzemOtaAugment):jarzemOtaAugment(projectDefinition);
 """
@@ -147,6 +156,10 @@ def main() -> None:
         raise SystemExit('Generated converter lexical scope isolation missing')
     if "e.binary('enable_ota',ea.ALL" not in generated:
         raise SystemExit('Generated converter enable_ota is not writable')
+    if ".withEndpoint('ota_control')" not in generated and '.withEndpoint("ota_control")' not in generated:
+        raise SystemExit('Generated converter enable_ota is not bound to endpoint 11')
+    if 'multiEndpointSkip:' not in generated or "'enable_ota'" not in generated:
+        raise SystemExit('Generated converter does not suppress OTA endpoint suffixes')
     if ".withCategory('config')" in generated or '.withCategory("config")' in generated:
         raise SystemExit('Generated converter enable_ota is incorrectly marked as config-category')
 
@@ -154,7 +167,7 @@ def main() -> None:
     print(f'  firmware build: {version}')
     print('  single-file deployment: yes')
     print('  project/OTA lexical scope isolation: yes')
-    print('  OTA HA enable_ota: normal writable STATE+SET+GET control')
+    print('  OTA HA enable_ota: endpoint 11, STATE+SET+GET, unsuffixed')
 
 
 if __name__ == '__main__':
