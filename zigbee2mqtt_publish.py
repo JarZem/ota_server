@@ -67,7 +67,6 @@ class _Z2MBridgeSession:
     response_event: threading.Event = field(default_factory=threading.Event)
     lock: threading.Lock = field(default_factory=threading.Lock)
     converters: dict[str, str] = field(default_factory=dict)
-    response_topic: str | None = None
     response_payload: dict | None = None
     expected_transaction: int | None = None
 
@@ -117,7 +116,6 @@ class _Z2MBridgeSession:
         with self.lock:
             if self.expected_transaction is None or transaction != self.expected_transaction:
                 return
-            self.response_topic = message.topic
             self.response_payload = payload
         self.response_event.set()
 
@@ -127,8 +125,6 @@ class _Z2MBridgeSession:
         if not self.connected.wait(MQTT_TIMEOUT_SECONDS):
             self.stop()
             raise ValueError("zigbee2mqtt_mqtt_connect_timeout")
-        # bridge/converters is normally retained. Do not fail if the retained
-        # snapshot is absent; save/remove will publish a fresh snapshot.
         self.converters_event.wait(3)
 
     def stop(self) -> None:
@@ -152,7 +148,6 @@ class _Z2MBridgeSession:
         topic = f"{self.base_topic}/bridge/request/converter/{action}"
         with self.lock:
             self.expected_transaction = transaction
-            self.response_topic = None
             self.response_payload = None
         self.response_event.clear()
         result = self.client.publish(topic, json.dumps(body, separators=(",", ":")), qos=1, retain=False)
@@ -193,18 +188,24 @@ def _deploy_via_zigbee2mqtt(base_topic: str, name: str, code: str, legacy_names:
     session.start()
     try:
         before = session.snapshot()
+        previous_code = before.get(name)
+
+        # Save first. Zigbee2MQTT publishes bridge/converters again after a
+        # runtime change, so this also gives us an authoritative snapshot even
+        # when bridge/converters was not retained at subscribe time.
+        session.save(name, code)
+        current = session.wait_until(lambda c: c.get(name) == code, f"save:{name}")
+
         removed: list[str] = []
         for legacy in legacy_names:
-            if legacy in session.snapshot():
+            if legacy in current:
                 session.remove(legacy)
-                session.wait_until(lambda c, n=legacy: n not in c, f"remove:{legacy}")
+                current = session.wait_until(lambda c, n=legacy: n not in c, f"remove:{legacy}")
                 removed.append(legacy)
 
-        previous_code = session.snapshot().get(name)
-        session.save(name, code)
         final = session.wait_until(
             lambda c: c.get(name) == code and all(legacy not in c for legacy in legacy_names),
-            f"save:{name}",
+            f"final:{name}",
         )
         return {
             "changed": previous_code != code or bool(removed),
