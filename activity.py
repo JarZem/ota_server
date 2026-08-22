@@ -10,9 +10,23 @@ def _now() -> int:
     return int(time.time())
 
 
+def record_activity(category: str, action: str, *, device_id: str | None = None,
+                    detail: str | None = None, severity: str = 'INFO') -> None:
+    category = str(category or 'OTHER').upper()[:16]
+    severity = str(severity or 'INFO').upper()[:8]
+    action = str(action or '')[:96]
+    normalized = normalize_device_id(device_id) if device_id else None
+    with db_connect() as conn:
+        conn.execute(
+            "INSERT INTO activity_log (created_at, category, severity, device_id, action, detail) VALUES (?, ?, ?, ?, ?, ?)",
+            (_now(), category, severity, normalized, action, str(detail or '')[:1024]),
+        )
+
+
 def record_firmware_publish(*, version: str, filename: str, sha256: str, size: int,
                             publisher_device_id: str, certificate_fingerprint: str) -> None:
     now = _now()
+    device_id = normalize_device_id(publisher_device_id)
     with db_connect() as conn:
         conn.execute(
             """
@@ -26,104 +40,88 @@ def record_firmware_publish(*, version: str, filename: str, sha256: str, size: i
                 firmware_size=excluded.firmware_size,
                 publisher_device_id=excluded.publisher_device_id,
                 publisher_certificate_fingerprint=excluded.publisher_certificate_fingerprint,
-                bin_verified=1,
-                published_at=excluded.published_at,
-                last_error=NULL
+                bin_verified=1, published_at=excluded.published_at, last_error=NULL
             """,
-            (version, filename, sha256, int(size), normalize_device_id(publisher_device_id),
-             certificate_fingerprint, now),
+            (version, filename, sha256, int(size), device_id, certificate_fingerprint, now),
         )
+    record_activity('BIN', 'BIN registered and signature verified', device_id=device_id,
+                    detail=f'{filename} build={version} sha={str(sha256)[:12]} bytes={int(size)}')
 
 
 def record_converter_publish(*, version: str, project: str, filename: str, sha256: str,
                              publisher_device_id: str, loaded: bool, error: str | None = None) -> None:
     now = _now()
+    device_id = normalize_device_id(publisher_device_id)
     with db_connect() as conn:
         row = conn.execute(
             "SELECT id FROM artifact_publications WHERE firmware_version=? AND publisher_device_id=? ORDER BY published_at DESC LIMIT 1",
-            (version, normalize_device_id(publisher_device_id)),
+            (version, device_id),
         ).fetchone()
         if row:
             conn.execute(
-                """
-                UPDATE artifact_publications
-                SET converter_project=?, converter_filename=?, converter_sha256=?,
-                    mjs_verified=?, z2m_loaded=?, converter_published_at=?, last_error=?
-                WHERE id=?
-                """,
-                (project, filename, sha256, 1 if not error else 0, 1 if loaded else 0,
-                 now, error, row['id']),
+                """UPDATE artifact_publications SET converter_project=?, converter_filename=?, converter_sha256=?,
+                   mjs_verified=?, z2m_loaded=?, converter_published_at=?, last_error=? WHERE id=?""",
+                (project, filename, sha256, 1 if not error else 0, 1 if loaded else 0, now, error, row['id']),
             )
+    record_activity('MJS', 'Converter verified and loaded' if loaded and not error else 'Converter publish failed',
+                    device_id=device_id, detail=f'{filename} build={version} sha={str(sha256)[:12]}' + (f' error={error}' if error else ''),
+                    severity='ERROR' if error else 'INFO')
 
 
 def provisioning_state(device_id: str, counter: int, state: str, error: str | None = None) -> None:
-    now = _now()
-    device_id = normalize_device_id(device_id)
+    now = _now(); device_id = normalize_device_id(device_id)
     with db_connect() as conn:
         conn.execute(
-            """
-            INSERT INTO provisioning_attempts
-                (device_id, counter, state, started_at, updated_at, error)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT (device_id, counter) DO UPDATE SET
-                state=excluded.state, updated_at=excluded.updated_at, error=excluded.error
-            """,
+            """INSERT INTO provisioning_attempts (device_id, counter, state, started_at, updated_at, error)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT (device_id, counter) DO UPDATE SET state=excluded.state, updated_at=excluded.updated_at, error=excluded.error""",
             (device_id, int(counter), state, now, now, error),
         )
         if state == 'CHALLENGE_SENT':
             conn.execute("UPDATE provisioning_attempts SET challenge_sent_at=?, updated_at=?, state=?, error=? WHERE device_id=? AND counter=?", (now, now, state, error, device_id, int(counter)))
         elif state == 'PROVISIONING_SENT':
-            # P is emitted only after the main state machine has verified R.
             conn.execute("UPDATE provisioning_attempts SET response_verified_at=COALESCE(response_verified_at, ?), provisioning_sent_at=?, updated_at=?, state=?, error=? WHERE device_id=? AND counter=?", (now, now, now, state, error, device_id, int(counter)))
         elif state in ('COMPLETED', 'TIMEOUT', 'ERROR'):
             conn.execute("UPDATE provisioning_attempts SET completed_at=?, updated_at=?, state=?, error=? WHERE device_id=? AND counter=?", (now, now, state, error, device_id, int(counter)))
+    record_activity('PROV', state, device_id=device_id, detail=f'counter={counter}' + (f' error={error}' if error else ''),
+                    severity='ERROR' if error or state in ('ERROR','TIMEOUT') else 'INFO')
 
 
 def firmware_device_state(*, device_id: str, sha256: str, filename: str, version: str,
                           code: str | None, state: str, token_expires_at: int | None = None,
                           error: str | None = None) -> None:
-    now = _now()
-    timestamp_columns = {
-        'CHECK_CREATED': 'check_created_at',
-        'CHECK_SENT': 'check_sent_at',
-        'DOWNLOAD_STARTED': 'download_started_at',
-        'DOWNLOAD_COMPLETED': 'download_finished_at',
-        'DOWNLOAD_FAILED': 'download_failed_at',
-        'DEVICE_CONFIRMED': 'grant_consumed_at',
-        'SKIPPED': 'download_finished_at',
-    }
-    device_id = normalize_device_id(device_id)
-    sha256 = str(sha256).lower()
+    now = _now(); device_id = normalize_device_id(device_id); sha256 = str(sha256).lower()
+    timestamp_columns = {'CHECK_CREATED':'check_created_at','CHECK_SENT':'check_sent_at','DOWNLOAD_STARTED':'download_started_at',
+                         'DOWNLOAD_COMPLETED':'download_finished_at','DOWNLOAD_FAILED':'download_failed_at','DEVICE_CONFIRMED':'grant_consumed_at','SKIPPED':'download_finished_at'}
     with db_connect() as conn:
         conn.execute(
-            """
-            INSERT INTO device_firmware_status
-                (device_id, firmware_sha256, firmware_filename, firmware_version,
-                 firmware_code, state, token_expires_at, last_error, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT (device_id, firmware_sha256) DO UPDATE SET
-                firmware_filename=excluded.firmware_filename,
-                firmware_version=excluded.firmware_version,
-                firmware_code=excluded.firmware_code,
-                state=excluded.state,
-                token_expires_at=COALESCE(excluded.token_expires_at, token_expires_at),
-                last_error=excluded.last_error,
-                updated_at=excluded.updated_at
-            """,
+            """INSERT INTO device_firmware_status
+               (device_id, firmware_sha256, firmware_filename, firmware_version, firmware_code, state, token_expires_at, last_error, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT (device_id, firmware_sha256) DO UPDATE SET firmware_filename=excluded.firmware_filename,
+               firmware_version=excluded.firmware_version, firmware_code=excluded.firmware_code, state=excluded.state,
+               token_expires_at=COALESCE(excluded.token_expires_at, token_expires_at), last_error=excluded.last_error, updated_at=excluded.updated_at""",
             (device_id, sha256, filename, version, code, state, token_expires_at, error, now),
         )
         column = timestamp_columns.get(state)
         if column:
-            conn.execute(
-                f"UPDATE device_firmware_status SET {column}=?, state=?, last_error=?, updated_at=? WHERE device_id=? AND firmware_sha256=?",
-                (now, state, error, now, device_id, sha256),
-            )
+            conn.execute(f"UPDATE device_firmware_status SET {column}=?, state=?, last_error=?, updated_at=? WHERE device_id=? AND firmware_sha256=?",
+                         (now, state, error, now, device_id, sha256))
+    category = 'DOWNLOAD' if state.startswith('DOWNLOAD_') or state == 'DEVICE_CONFIRMED' else 'CHECK'
+    record_activity(category, state, device_id=device_id,
+                    detail=f'{filename} build={version} sha={sha256[:12]}' + (f' code={code}' if code else '') + (f' error={error}' if error else ''),
+                    severity='ERROR' if error or state == 'DOWNLOAD_FAILED' else 'INFO')
 
 
-def _fmt(ts) -> str:
-    if not ts:
-        return ''
-    return time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(int(ts)))
+def _compact_time(ts) -> str:
+    if not ts: return ''
+    value = int(ts); now = time.time()
+    today = time.localtime(now); event = time.localtime(value)
+    today_mid = int(time.mktime((today.tm_year,today.tm_mon,today.tm_mday,0,0,0,today.tm_wday,today.tm_yday,today.tm_isdst)))
+    event_mid = int(time.mktime((event.tm_year,event.tm_mon,event.tm_mday,0,0,0,event.tm_wday,event.tm_yday,event.tm_isdst)))
+    days = max(0, (today_mid-event_mid)//86400)
+    prefix = 'T' if days == 0 else f'-{days}'
+    return f'{prefix} {time.strftime("%H:%M:%S", event)}'
 
 
 def _e(value) -> str:
@@ -132,42 +130,44 @@ def _e(value) -> str:
 
 def render_ingress_tables() -> str:
     with db_connect() as conn:
+        events = conn.execute("SELECT * FROM activity_log ORDER BY created_at DESC, id DESC LIMIT 500").fetchall()
         artifacts = conn.execute("SELECT * FROM artifact_publications ORDER BY published_at DESC LIMIT 50").fetchall()
         provisioning = conn.execute("SELECT * FROM provisioning_attempts ORDER BY updated_at DESC LIMIT 100").fetchall()
         device_fw = conn.execute("SELECT * FROM device_firmware_status ORDER BY updated_at DESC LIMIT 200").fetchall()
 
-    artifact_rows = ''.join(
-        '<tr><td>{}</td><td>{}</td><td><code>{}</code></td><td>{}</td><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><code>{}</code></td></tr>'.format(
-            _e(r['firmware_version']), _e(r['firmware_filename']), _e(str(r['firmware_sha256'])[:12]),
-            _e(r['converter_filename']), _e(str(r['converter_sha256'] or '')[:12]),
-            'OK' if r['bin_verified'] else 'NO', 'OK' if r['mjs_verified'] else 'NO',
-            'OK' if r['z2m_loaded'] else 'NO', _e(_fmt(r['converter_published_at'] or r['published_at'])),
-            _e(str(r['publisher_certificate_fingerprint'] or '')[:12]))
-        for r in artifacts
-    ) or '<tr><td colspan="10">No published artifact records yet.</td></tr>'
+    event_rows = ''.join(
+        '<tr class="ota-event ota-cat-{cat} ota-sev-{sev}" data-cat="{cat}"><td class="ota-time">{time}</td><td><span class="ota-badge">{cat}</span></td><td>{action}</td><td><code>{dev}</code></td><td>{detail}</td></tr>'.format(
+            cat=_e(str(r['category']).upper()), sev=_e(str(r['severity']).lower()), time=_e(_compact_time(r['created_at'])),
+            action=_e(r['action']), dev=_e(r['device_id']), detail=_e(r['detail'])) for r in events
+    ) or '<tr><td colspan="5">No activity yet.</td></tr>'
 
-    provisioning_rows = ''.join(
-        '<tr><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>'.format(
-            _e(r['device_id']), _e(r['counter']), _e(r['state']), _e(_fmt(r['started_at'])),
-            _e(_fmt(r['challenge_sent_at'])), _e(_fmt(r['response_verified_at'])),
-            _e(_fmt(r['provisioning_sent_at'])), _e(_fmt(r['completed_at'])), _e(r['error']))
-        for r in provisioning
-    ) or '<tr><td colspan="9">No provisioning attempts recorded yet.</td></tr>'
-
-    firmware_rows = ''.join(
-        '<tr><td><code>{}</code></td><td>{}</td><td>{}</td><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>'.format(
-            _e(r['device_id']), _e(r['firmware_version']), _e(r['firmware_filename']),
-            _e(str(r['firmware_sha256'])[:12]), _e(r['firmware_code']), _e(r['state']),
-            _e(_fmt(r['check_sent_at'] or r['check_created_at'])), _e(_fmt(r['download_started_at'])),
-            _e(_fmt(r['download_finished_at'])), _e(_fmt(r['token_expires_at'])), _e(r['last_error']))
-        for r in device_fw
-    ) or '<tr><td colspan="11">No ESP × firmware activity recorded yet.</td></tr>'
+    artifact_rows = ''.join('<tr><td>{}</td><td>{}</td><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td></tr>'.format(
+        _e(_compact_time(r['converter_published_at'] or r['published_at'])), _e(r['firmware_version']), _e(str(r['firmware_sha256'])[:12]),
+        'OK' if r['bin_verified'] else 'NO', 'OK' if r['mjs_verified'] else 'NO', 'OK' if r['z2m_loaded'] else 'NO') for r in artifacts) or '<tr><td colspan="6">No artifacts.</td></tr>'
+    provisioning_rows = ''.join('<tr><td>{}</td><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td></tr>'.format(
+        _e(_compact_time(r['updated_at'])), _e(r['device_id']), _e(r['counter']), _e(r['state']), _e(r['error'])) for r in provisioning) or '<tr><td colspan="5">No provisioning.</td></tr>'
+    firmware_rows = ''.join('<tr><td>{}</td><td><code>{}</code></td><td>{}</td><td>{}</td><td><code>{}</code></td><td>{}</td><td>{}</td></tr>'.format(
+        _e(_compact_time(r['updated_at'])), _e(r['device_id']), _e(r['firmware_version']), _e(r['firmware_filename']),
+        _e(str(r['firmware_sha256'])[:12]), _e(r['state']), _e(r['last_error'])) for r in device_fw) or '<tr><td colspan="7">No ESP × firmware activity.</td></tr>'
 
     return f'''
-<h3>Published BIN + Zigbee2MQTT converter</h3>
-<div class="table-wrap"><table><thead><tr><th>Build</th><th>BIN</th><th>BIN SHA</th><th>MJS</th><th>MJS SHA</th><th>BIN verified</th><th>MJS verified</th><th>Z2M loaded</th><th>Time</th><th>Publisher cert</th></tr></thead><tbody>{artifact_rows}</tbody></table></div>
-<h3>Provisioning attempts</h3>
-<div class="table-wrap"><table><thead><tr><th>ESP</th><th>Counter</th><th>State</th><th>HELLO seen</th><th>Challenge sent</th><th>Response verified</th><th>Provision sent</th><th>Finished</th><th>Error</th></tr></thead><tbody>{provisioning_rows}</tbody></table></div>
-<h3>ESP × firmware OTA state</h3>
-<div class="table-wrap"><table><thead><tr><th>ESP</th><th>Build</th><th>BIN</th><th>SHA</th><th>Code</th><th>State</th><th>CHECK</th><th>Download start</th><th>Download finish</th><th>Token expires</th><th>Error</th></tr></thead><tbody>{firmware_rows}</tbody></table></div>
+<style>
+.ota-log-toolbar{{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0 10px}} .ota-filter{{border:1px solid #666;border-radius:4px;padding:3px 8px;background:#222;color:#ddd;cursor:pointer}}
+.ota-filter.active{{background:#ddd;color:#111}} .ota-log table{{font-size:12px}} .ota-log td{{padding:3px 6px;vertical-align:top}} .ota-time{{white-space:nowrap;font-family:monospace}}
+.ota-badge{{font-weight:700}} .ota-cat-REG .ota-badge{{color:#6cf}} .ota-cat-BIN .ota-badge{{color:#7ee787}} .ota-cat-MJS .ota-badge{{color:#d2a8ff}}
+.ota-cat-PROV .ota-badge{{color:#ffa657}} .ota-cat-CHECK .ota-badge{{color:#79c0ff}} .ota-cat-DOWNLOAD .ota-badge{{color:#3fb950}} .ota-cat-MQTT .ota-badge{{color:#a5d6ff}}
+.ota-sev-error td{{background:rgba(248,81,73,.16)}} details.ota-detail{{margin-top:12px}} details.ota-detail summary{{cursor:pointer;font-weight:600}}
+</style>
+<h3>OTA activity</h3>
+<div class="ota-log-toolbar">
+<button type="button" class="ota-filter active" data-filter="ALL">ALL</button><button type="button" class="ota-filter" data-filter="REG">REG</button>
+<button type="button" class="ota-filter" data-filter="BIN">BIN</button><button type="button" class="ota-filter" data-filter="MJS">MJS</button>
+<button type="button" class="ota-filter" data-filter="PROV">PROV</button><button type="button" class="ota-filter" data-filter="CHECK">CHECK</button>
+<button type="button" class="ota-filter" data-filter="DOWNLOAD">DOWNLOAD</button><button type="button" class="ota-filter" data-filter="MQTT">MQTT</button>
+</div>
+<div class="table-wrap ota-log"><table><thead><tr><th>Time</th><th>What</th><th>Event</th><th>ESP</th><th>Detail</th></tr></thead><tbody>{event_rows}</tbody></table></div>
+<script>document.querySelectorAll('.ota-filter').forEach(b=>b.addEventListener('click',()=>{{const f=b.dataset.filter;document.querySelectorAll('.ota-filter').forEach(x=>x.classList.toggle('active',x===b));document.querySelectorAll('.ota-event').forEach(r=>r.style.display=(f==='ALL'||r.dataset.cat===f)?'':'none');}}));</script>
+<details class="ota-detail"><summary>Published BIN / MJS detail</summary><div class="table-wrap"><table><thead><tr><th>Time</th><th>Build</th><th>BIN SHA</th><th>BIN</th><th>MJS</th><th>Z2M</th></tr></thead><tbody>{artifact_rows}</tbody></table></div></details>
+<details class="ota-detail"><summary>Provisioning detail</summary><div class="table-wrap"><table><thead><tr><th>Time</th><th>ESP</th><th>Counter</th><th>State</th><th>Error</th></tr></thead><tbody>{provisioning_rows}</tbody></table></div></details>
+<details class="ota-detail"><summary>ESP × firmware detail</summary><div class="table-wrap"><table><thead><tr><th>Time</th><th>ESP</th><th>Build</th><th>BIN</th><th>SHA</th><th>State</th><th>Error</th></tr></thead><tbody>{firmware_rows}</tbody></table></div></details>
 '''
