@@ -2,10 +2,10 @@
 get_filename_component(JARZEM_OTA_REPO_ROOT "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
 get_filename_component(JARZEM_OTA_PROJECT_ROOT "${CMAKE_CURRENT_LIST_DIR}/../../../.." ABSOLUTE)
 
-# Transparent Zigbee integration. Existing project code keeps calling the
-# Espressif APIs; GNU ld redirects those two calls through the OTA component.
-idf_build_set_property(LINK_OPTIONS "-Wl,--wrap=esp_zb_device_register" APPEND)
-idf_build_set_property(LINK_OPTIONS "-Wl,--wrap=esp_zb_core_action_handler_register" APPEND)
+# Zigbee integration is explicit in the application: it calls
+# jarzem_ota_device_register(ep_list) and jarzem_ota_action_handler_register().
+# Do not use GNU ld --wrap here; endpoint 10/11 registration must be visible
+# and deterministic in the application source.
 
 if(DEFINED PYTHON AND EXISTS "${PYTHON}")
     set(JARZEM_OTA_PYTHON "${PYTHON}")
