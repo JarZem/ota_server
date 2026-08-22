@@ -42,10 +42,12 @@ def _validate_ota_module(path: Path, text: str) -> None:
         raise SystemExit(f'OTA module {path} is incomplete, missing: {", ".join(missing)}')
     if "e.binary('enable_ota',ea.ALL" not in text:
         raise SystemExit('OTA module enable_ota must expose STATE+SET+GET access')
-    if ".withEndpoint('ota_control')" not in text and '.withEndpoint("ota_control")' not in text:
-        raise SystemExit('OTA module controls must be explicitly bound to endpoint ota_control')
+    if ".withEndpoint('ota_control')" in text or '.withEndpoint("ota_control")' in text:
+        raise SystemExit('OTA module controls must remain unsuffixed; endpoint 11 is selected internally')
+    if "endpoints:['ota_control']" in text or 'endpoints:["ota_control"]' in text:
+        raise SystemExit('OTA toZigbee controls must remain unsuffixed; endpoint 11 is selected internally')
     if 'endpointMap={ota_control:OTA_CONTROL_ENDPOINT}' not in text:
-        raise SystemExit('OTA module must map ota_control to OTA_CONTROL_ENDPOINT')
+        raise SystemExit('OTA module must keep ota_control endpoint mapping for device metadata/interview')
     if ".withCategory('config')" in text or '.withCategory("config")' in text:
         raise SystemExit('OTA module enable_ota must be a normal control, not a disabled/config-category HA entity')
 
@@ -156,8 +158,10 @@ def main() -> None:
         raise SystemExit('Generated converter lexical scope isolation missing')
     if "e.binary('enable_ota',ea.ALL" not in generated:
         raise SystemExit('Generated converter enable_ota is not writable')
-    if ".withEndpoint('ota_control')" not in generated and '.withEndpoint("ota_control")' not in generated:
-        raise SystemExit('Generated converter enable_ota is not bound to endpoint 11')
+    if ".withEndpoint('ota_control')" in generated or '.withEndpoint("ota_control")' in generated:
+        raise SystemExit('Generated converter unexpectedly endpoint-suffixes OTA controls')
+    if "endpoints:['ota_control']" in generated or 'endpoints:["ota_control"]' in generated:
+        raise SystemExit('Generated converter unexpectedly endpoint-suffixes OTA toZigbee keys')
     if 'multiEndpointSkip:' not in generated or "'enable_ota'" not in generated:
         raise SystemExit('Generated converter does not suppress OTA endpoint suffixes')
     if ".withCategory('config')" in generated or '.withCategory("config")' in generated:
@@ -167,7 +171,7 @@ def main() -> None:
     print(f'  firmware build: {version}')
     print('  single-file deployment: yes')
     print('  project/OTA lexical scope isolation: yes')
-    print('  OTA HA enable_ota: endpoint 11, STATE+SET+GET, unsuffixed')
+    print('  OTA HA enable_ota: endpoint 11 internal, STATE+SET+GET, unsuffixed')
 
 
 if __name__ == '__main__':
