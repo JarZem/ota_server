@@ -13,6 +13,7 @@ export const OTA_ENABLE_ATTR_ID=0x0000;
 export const OTA_STATUS_ATTR_ID=0x0000;
 
 const OTA_ZIGBEE_WIRE_MAX=100;
+const OTA_CONTROL_READBACK_DELAY_MS=120;
 const OTA_DIAG_LEN_RE=/^D\|LEN\|(100|[1-9][0-9]?)$/;
 const OTA_CHALLENGE_RE=/^A\|[0-9A-Za-z_-]{11}\|[0-9A-Za-z_-]{86}$/;
 const OTA_PROVISION_RE=/^P\|[0-9A-Za-z_-]+$/;
@@ -45,6 +46,7 @@ const decodeOtaControlUplink=(payload)=>{
 };
 
 const b64urlDecode=(s)=>Buffer.from(s.replace(/-/g,'+').replace(/_/g,'/')+'='.repeat((4-s.length%4)%4),'base64');
+const delay=(ms)=>new Promise((resolve)=>setTimeout(resolve,ms));
 const otaControlEndpoint=(entity,meta)=>meta?.device?.getEndpoint(OTA_CONTROL_ENDPOINT)??(entity?.ID===OTA_CONTROL_ENDPOINT?entity:undefined);
 
 const validateOtaCommand=(value)=>{
@@ -78,8 +80,6 @@ const logOtaUplink=(msg,meta,payload)=>{
 const otaUplinkState=(msg,meta,payload)=>{
     logOtaUplink(msg,meta,payload);
     const control=decodeOtaControlUplink(payload);
-    // Internal OTA transport is deliberately not exposed as Home Assistant action.
-    // OTA server reads ota_transport from the normal Zigbee2MQTT device state topic.
     return control?{...control,ota_transport:payload}:{ota_transport:payload};
 };
 
@@ -130,7 +130,10 @@ const toEnable={key:['enable_ota'],convertSet:async(entity,key,value,meta)=>{
     if(!endpoint)throw new Error(`OTA control endpoint ${OTA_CONTROL_ENDPOINT} not found on device; re-interview device`);
     const enabled=String(value).toUpperCase()==='ON'||value===true||value===1;
     await endpoint.write(OTA_ENABLE_CLUSTER_NAME,{[OTA_ENABLE_ATTR_NAME]:enabled},{manufacturerCode:OTA_MANUFACTURER_CODE});
-    return{state:{enable_ota:enabled?'ON':'OFF'}};
+    await delay(OTA_CONTROL_READBACK_DELAY_MS);
+    await endpoint.read(OTA_ENABLE_CLUSTER_NAME,[OTA_ENABLE_ATTR_NAME],{manufacturerCode:OTA_MANUFACTURER_CODE});
+    await endpoint.read(OTA_STATUS_CLUSTER_NAME,[OTA_STATUS_ATTR_NAME],{manufacturerCode:OTA_MANUFACTURER_CODE});
+    return{state:{}};
 },convertGet:async(entity,key,meta)=>{
     const endpoint=otaControlEndpoint(entity,meta);
     if(!endpoint)throw new Error(`OTA control endpoint ${OTA_CONTROL_ENDPOINT} not found on device; re-interview device`);
@@ -155,8 +158,6 @@ export const exposes=[
     e.binary('enable_ota',ea.STATE_SET,'ON','OFF'),
     e.text('ota_status',ea.STATE_GET),
 ];
-// OTA endpoints are addressed explicitly by the converters above. They are not
-// added to the public endpoint map so HA does not suffix entity names/topics.
 export const endpointMap={};
 
 export const configure=async(device,coordinatorEndpoint,logger)=>{
