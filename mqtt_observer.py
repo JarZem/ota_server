@@ -93,15 +93,6 @@ def _grant_expiry(device_id: str, code: str, sha256_hex: str) -> int | None:
     return int(row['expires_at']) if row else None
 
 
-def _firmware_for_grant_random(device_id: str, random_b64: str) -> dict | None:
-    import base64
-    try: raw = base64.urlsafe_b64decode(random_b64 + '=' * ((-len(random_b64)) % 4))
-    except Exception: return None
-    with db_connect() as conn:
-        row = conn.execute("SELECT g.sha256, g.version, g.code, i.filename FROM download_grants g JOIN firmware_alias a ON a.code=g.code JOIN firmware_images i ON i.filename=a.filename AND i.sha256=g.sha256 WHERE g.device_id=? AND g.grant_random=? ORDER BY g.id DESC LIMIT 1", (device_id, raw)).fetchone()
-    return dict(row) if row else None
-
-
 def _handle(device_id: str, wire: str, direction: str) -> None:
     if wire.startswith('H|') and direction == 'ESP_TO_OTA':
         parts = wire.split('|')
@@ -135,12 +126,12 @@ def _handle(device_id: str, wire: str, direction: str) -> None:
                 firmware_device_state(device_id=device_id, sha256=image['sha256'], filename=image['filename'], version=version, code=code, state='CHECK_SENT', token_expires_at=_grant_expiry(device_id, code, image['sha256']))
         return
 
+    # F is deliberately not persisted here. The observer is passive and cannot
+    # prove that the preceding HTTPS transfer completed. mqtt_listener validates
+    # the grant against DOWNLOAD_COMPLETED and is the sole authority that may
+    # advance the cross-table to DEVICE_CONFIRMED.
     if wire.startswith('F|') and direction == 'ESP_TO_OTA':
-        parts = wire.split('|')
-        if len(parts) == 2:
-            image = _firmware_for_grant_random(device_id, parts[1])
-            if image:
-                firmware_device_state(device_id=device_id, sha256=image['sha256'], filename=image['filename'], version=image['version'], code=image['code'], state='DEVICE_CONFIRMED')
+        return
 
 
 def _timeout_loop() -> None:
