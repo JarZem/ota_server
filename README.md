@@ -1,6 +1,23 @@
 # OTA Server
 
-Home Assistant add-on providing secure ESP firmware delivery, provisioning over Zigbee2MQTT, manufacturing PKI, automatic Zigbee2MQTT converter deployment and persistent OTA lifecycle history.
+JarZem Secure OTA exists because the device normally lives on Zigbee, while a firmware image is too large to transfer that way efficiently; Zigbee is therefore used for authenticated control and Wi-Fi/HTTPS is enabled only for the actual protected firmware download.
+
+Unlike a simple MQTT or generic OTA mechanism, this design provides one complete trust chain: offline Root CA, unique ESP certificates, authenticated provisioning of Wi-Fi credentials, authenticated OTA CHECK messages, short-lived per-device download authorization, HTTPS firmware transfer, SHA-256 verification and persistent audit history.
+
+In short:
+
+```text
+Zigbee / Zigbee2MQTT
+  secure provisioning + authenticated OTA CHECK + status
+
+Wi-Fi / HTTPS
+  actual firmware BIN download
+
+Offline Root CA + device certificates
+  decide which OTA server and which ESP identities are trusted
+```
+
+A forged MQTT/Zigbee message must not be sufficient to trigger a firmware download, and knowing the firmware URL must not be sufficient to download a BIN.
 
 This README is the authoritative human-readable description of the trust model and the expected end-to-end workflow.
 
@@ -296,9 +313,27 @@ Examples:
 
 After boot the ESP reports `Enable OTA=false` and `Status=idle`.
 
-## 8. OTA CHECK and five-minute download token
+## 8. OTA CHECK, Wi-Fi transition and protected firmware download
 
 Firmware check is independent from the provisioning switch.
+
+The two transports have deliberately different jobs:
+
+```text
+Zigbee / Zigbee2MQTT
+  authenticated OTA CHECK and control/status messages
+
+Wi-Fi / HTTPS
+  actual BIN transfer
+```
+
+The ESP does not download the firmware BIN over Zigbee. Zigbee only tells the ESP that a specific authenticated firmware offer exists. When the offer is valid and newer than the running firmware, the ESP temporarily uses the Wi-Fi credentials received during provisioning and connects to the configured OTA server over HTTPS.
+
+This means a suitable Wi-Fi network must physically reach the ESP at the place where the OTA update is performed. The network must also be supported by the ESP hardware/firmware configuration. If the provisioned Wi-Fi is unavailable, out of range, incompatible, or the OTA server cannot be reached from it, the authenticated CHECK can still arrive over Zigbee but the BIN cannot be downloaded.
+
+That requirement is the main reason Wi-Fi credentials and OTA host/port are part of provisioning instead of being hard-coded into every application project.
+
+### Why an attacker cannot simply send a fake CHECK
 
 OTA sends:
 
@@ -306,18 +341,62 @@ OTA sends:
 C|<version>|<three-character-code>|<fresh-random>|<MAC>
 ```
 
-The MAC is derived from the last successfully completed provisioning context. The ESP authenticates the CHECK before comparing versions.
+The MAC is calculated from cryptographic material derived from the last successfully completed provisioning context. That context ultimately depends on the authenticated P-256 ECDH session between the registered ESP identity and the OTA server.
 
-The fresh CHECK random also derives a unique HTTPS Bearer token. OTA and ESP calculate the same token; the token itself is not sent over Zigbee. Its maximum lifetime is five minutes and it is consumed after successful download.
+The ESP verifies the CHECK MAC before it trusts the offered version or starts Wi-Fi OTA. A random MQTT or Zigbee message containing `C|...` therefore does not authorize a download. A recorded old CHECK is also not reusable as a fresh authorization because every legitimate CHECK contains a fresh random value and the server keeps short-lived per-device grant state.
 
-The HTTPS firmware GET requires both:
+### The download token is never sent over Zigbee
+
+The fresh CHECK random and the successful provisioning context allow OTA and the ESP to derive the same one-time HTTPS Bearer token independently.
+
+The token itself is therefore not transmitted in the Zigbee CHECK. Its maximum validity is five minutes and it is bound server-side to:
+
+```text
+ESP device identity
+firmware code
+firmware SHA-256
+one specific download grant
+expiry time
+```
+
+The HTTPS firmware request requires:
 
 ```text
 Authorization: Bearer <derived-token>
 X-Device-ID: <ESP IEEE>
 ```
 
-OTA validates token, device, firmware code and firmware SHA before serving bytes.
+OTA validates the device identity, token, firmware code, expected SHA-256, expiry and unused grant before serving firmware bytes.
+
+Knowing the OTA server address or guessing/copying a firmware URL is therefore insufficient to download a BIN. A request without the correct short-lived token for that ESP and that firmware is rejected.
+
+### Complete runtime update sequence
+
+```text
+OTA has a verified BIN
+        ↓
+OTA creates a fresh authenticated CHECK
+        ↓ Zigbee
+ESP verifies CHECK MAC
+        ↓
+ESP confirms offered firmware is newer
+        ↓
+ESP derives the one-time token
+        ↓
+ESP enables/connects Wi-Fi using provisioned credentials
+        ↓ HTTPS
+ESP requests the exact firmware code with token + Device-ID
+        ↓
+OTA validates grant and starts BIN transfer
+        ↓
+ESP streams BIN into OTA partition and calculates SHA-256
+        ↓
+ESP verifies the downloaded SHA-256 / firmware image
+        ↓
+ESP activates the new OTA partition according to ESP-IDF OTA rules
+```
+
+A successful HTTP transfer is recorded by the OTA server, while the ESP still performs its own image/hash verification before treating the update as valid. Download start, completion/failure and the ESP × BIN relationship are persisted in the OTA database and shown in ingress.
 
 ## 9. Persistent OTA lifecycle database and ingress
 
@@ -467,5 +546,7 @@ firmware binaries containing an embedded device_private.pem
 A bare public key is never sufficient to become a trusted publisher. OTA trusts an ESP public key only through a valid Root-CA-signed device certificate that matches the currently registered certificate for that device.
 
 BIN and MJS are independently signed, and the MJS is additionally accepted only after the matching signed BIN from the same publisher has already been verified.
+
+A forged CHECK does not authorize Wi-Fi OTA because the ESP authenticates the CHECK before deriving a download token. Knowledge of a firmware URL does not authorize a download because the OTA HTTPS endpoint also requires an unexpired per-device/per-firmware token.
 
 The Root CA private key remains the only authority capable of creating a new trusted OTA or ESP identity.
