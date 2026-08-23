@@ -53,8 +53,8 @@ echo "MQTT activity observer running pid=$OBSERVER_PID"
 python3 "$RUNTIME_DIR/server_mysql.py" &
 SERVER_PID=$!
 
-# Supervisor writes commands to PID 1 stdin. Read stdin in the foreground shell;
-# a background subshell may inherit /dev/null instead of the add-on stdin.
+# Supervisor writes command lines to PID 1 stdin. E2E test input is never read
+# from this same stream; it is supplied through a short-lived /share bundle.
 while kill -0 "$SERVER_PID" 2>/dev/null; do
     command=""
     if IFS= read -r -t 1 command; then
@@ -63,9 +63,20 @@ while kill -0 "$SERVER_PID" 2>/dev/null; do
                 echo "STDIN: running MQTT service diagnostic inside OTA add-on"
                 python3 "$RUNTIME_DIR/tests/debug_mqtt_service.py" || true
                 ;;
+            RUN_E2E_FILE\ *)
+                bundle="${command#RUN_E2E_FILE }"
+                case "$bundle" in
+                    /share/ota_server/e2e-input/*.json)
+                        echo "STDIN: starting live OTA E2E test bundle=$bundle"
+                        python3 "$RUNTIME_DIR/tests/run_ota_e2e_bundle.py" "$bundle" || true
+                        ;;
+                    *)
+                        echo "STDIN: rejected E2E bundle path: $bundle" >&2
+                        ;;
+                esac
+                ;;
             RUN_E2E)
-                echo "STDIN: starting live OTA E2E test inside OTA add-on"
-                python3 "$RUNTIME_DIR/tests/test_ota_e2e_live.py" || true
+                echo "STDIN: RUN_E2E without bundle is no longer supported; use Python supervisor launcher" >&2
                 ;;
             "")
                 ;;
