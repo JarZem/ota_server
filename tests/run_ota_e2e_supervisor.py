@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """Launch the live OTA E2E test inside the OTA add-on from Home Assistant SSH.
 
-The launcher gathers Root CA material locally, writes one short-lived mode-0600
-bundle under /share, and sends only the bundle path through Supervisor stdin.
-The OTA-side runner deletes the bundle immediately after reading it. This keeps
-Supervisor stdin as a command channel only and avoids mixing PEM/password input
-with run.sh commands.
+The launcher reads Root CA material only from files, writes one short-lived
+mode-0600 bundle under /share, and sends only the bundle path through Supervisor
+stdin. No PEM blocks are pasted interactively.
 """
 from __future__ import annotations
 
@@ -76,23 +74,16 @@ def send_stdin(slug: str, line: str) -> None:
 
 
 def read_pem_file(path: str, kind: str) -> str:
-    value = Path(path).expanduser().read_text(encoding='ascii')
+    p = Path(path).expanduser()
+    if not p.is_file():
+        raise RuntimeError(f'{p}: file does not exist')
+    value = p.read_text(encoding='ascii')
     if kind == 'certificate':
         if '-----BEGIN CERTIFICATE-----' not in value or '-----END CERTIFICATE-----' not in value:
-            raise RuntimeError(f'{path}: not a PEM certificate')
+            raise RuntimeError(f'{p}: not a PEM certificate')
     elif 'PRIVATE KEY-----' not in value:
-        raise RuntimeError(f'{path}: not a PEM private key')
+        raise RuntimeError(f'{p}: not a PEM private key')
     return value.rstrip('\r\n') + '\n'
-
-
-def paste_pem(label: str, endings: set[str]) -> str:
-    print(f'Paste {label}; PEM END line finishes input:')
-    lines: list[str] = []
-    while True:
-        line = input()
-        lines.append(line)
-        if line.strip() in endings:
-            return '\n'.join(lines) + '\n'
 
 
 def write_bundle(cert: str, key: str, password: str) -> Path:
@@ -134,7 +125,7 @@ def wait_for_marker(slug: str, marker: str, timeout: int = 30) -> int:
     raise TimeoutError(f'timeout waiting for {marker!r}\n--- OTA LOG TAIL ---\n{text[-5000:]}')
 
 
-def run(slug: str, ca_cert: str | None, ca_key: str | None,
+def run(slug: str, ca_cert: str, ca_key: str,
         password_env: str | None) -> int:
     info = addon_info(slug)
     if info.get('state') != 'started':
@@ -142,16 +133,9 @@ def run(slug: str, ca_cert: str | None, ca_key: str | None,
     if not info.get('stdin'):
         raise RuntimeError(f'OTA add-on {slug!r} does not have stdin enabled')
 
-    cert_path = ca_cert or DEFAULT_CA_CERT
-    cert = read_pem_file(cert_path, 'certificate')
-    key = (
-        read_pem_file(ca_key, 'private key') if ca_key else
-        paste_pem('Root CA private key', {
-            '-----END PRIVATE KEY-----',
-            '-----END ENCRYPTED PRIVATE KEY-----',
-            '-----END EC PRIVATE KEY-----',
-        })
-    )
+    cert = read_pem_file(ca_cert, 'certificate')
+    key = read_pem_file(ca_key, 'private key')
+
     if password_env:
         password = os.environ.get(password_env)
         if password is None:
@@ -162,6 +146,8 @@ def run(slug: str, ca_cert: str | None, ca_key: str | None,
     bundle = write_bundle(cert, key, password)
     marker = f'STDIN: starting live OTA E2E test bundle={bundle}'
     print(f"OTA add-on {slug} version={info.get('version')} state={info.get('state')}")
+    print(f'Root CA certificate: {ca_cert}')
+    print(f'Root CA private key: {ca_key}')
     print(f'Starting E2E inside OTA add-on using temporary bundle {bundle.name}...')
 
     try:
@@ -194,7 +180,6 @@ def run(slug: str, ca_cert: str | None, ca_key: str | None,
         print('\nFINAL RESULT: TIMEOUT')
         return 2
     finally:
-        # Normally the OTA-side runner deletes it immediately after reading.
         try:
             bundle.unlink()
         except FileNotFoundError:
@@ -204,8 +189,10 @@ def run(slug: str, ca_cert: str | None, ca_key: str | None,
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument('--slug', default=DEFAULT_SLUG)
-    parser.add_argument('--ca-cert', default=None, help=f'Root CA certificate PEM (default {DEFAULT_CA_CERT})')
-    parser.add_argument('--ca-key', help='Root CA private key PEM path; otherwise paste once into Python')
+    parser.add_argument('--ca-cert', default=DEFAULT_CA_CERT,
+                        help=f'Root CA certificate PEM path (default {DEFAULT_CA_CERT})')
+    parser.add_argument('--ca-key', required=True,
+                        help='Root CA private key PEM path; interactive PEM paste is intentionally disabled')
     parser.add_argument('--password-env', help='read Root CA key password from this environment variable')
     args = parser.parse_args()
     return run(args.slug, args.ca_cert, args.ca_key, args.password_env)
