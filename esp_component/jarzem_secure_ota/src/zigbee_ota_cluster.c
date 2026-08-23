@@ -12,6 +12,7 @@
 #include "esp_zigbee_core.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "jarzem_secure_ota.h"
 #include "mbedtls/base64.h"
 #include "ota_check_auth.h"
 #include "ota_config.h"
@@ -70,8 +71,14 @@ static esp_err_t zigbee_ota_send_command_payload(const char *payload)
     cmd.address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT; cmd.cluster_id = ZIGBEE_OTA_CLUSTER_ID; cmd.profile_id = ESP_ZB_AF_HA_PROFILE_ID;
     cmd.direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_CLI; cmd.custom_cmd_id = ZIGBEE_OTA_CMD_FROM_DEVICE_ID;
     cmd.data.type = ESP_ZB_ZCL_ATTR_TYPE_SET; cmd.data.size = payload_len + 1; cmd.data.value = wire;
-    if (!esp_zb_lock_acquire(portMAX_DELAY)) return ESP_ERR_TIMEOUT;
-    const uint8_t tsn = esp_zb_zcl_custom_cluster_cmd_req(&cmd); esp_zb_lock_release();
+    jarzem_ota_hook_radio_critical_enter();
+    if (!esp_zb_lock_acquire(portMAX_DELAY)) {
+        jarzem_ota_hook_radio_critical_exit();
+        return ESP_ERR_TIMEOUT;
+    }
+    const uint8_t tsn = esp_zb_zcl_custom_cluster_cmd_req(&cmd);
+    esp_zb_lock_release();
+    jarzem_ota_hook_radio_critical_exit();
     ESP_LOGI(TAG, "OTA custom command tx cluster=0x%04x cmd=0x%02x bytes=%u tsn=0x%02x payload=%s", ZIGBEE_OTA_CLUSTER_ID, ZIGBEE_OTA_CMD_FROM_DEVICE_ID, (unsigned)payload_len, tsn, payload);
     return ESP_OK;
 }
