@@ -25,7 +25,15 @@ void jarzem_ota_action_handler_register(jarzem_ota_project_action_handler_t proj
 
 /* Optional project UI hooks. Weak no-op implementations are provided by OTA. */
 void jarzem_ota_hook_rx_from_ha(void);
+void jarzem_ota_hook_tx_to_ha(void);
 void jarzem_ota_hook_provision_step(void);
+
+/*
+ * OTA custom-cluster uplinks pass through this wrapper. This keeps TX activity
+ * indication at the transport boundary instead of inside provisioning/CHECK logic.
+ */
+uint8_t jarzem_ota_custom_cluster_cmd_req(esp_zb_zcl_custom_cluster_cmd_req_t *cmd);
+#define esp_zb_zcl_custom_cluster_cmd_req(cmd) jarzem_ota_custom_cluster_cmd_req(cmd)
 
 /*
  * Optional RF-critical hooks. A project may use them to suspend nonessential
