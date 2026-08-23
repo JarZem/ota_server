@@ -53,11 +53,11 @@ echo "MQTT activity observer running pid=$OBSERVER_PID"
 python3 "$RUNTIME_DIR/server_mysql.py" &
 SERVER_PID=$!
 
-# Supervisor can write commands to the add-on stdin. Keeping diagnostics inside
-# this container means they use this add-on's own SUPERVISOR_TOKEN and therefore
-# the same dynamically-issued MQTT service credentials as production runtime.
-(
-    while IFS= read -r command; do
+# Supervisor writes commands to PID 1 stdin. Read stdin in the foreground shell;
+# a background subshell may inherit /dev/null instead of the add-on stdin.
+while kill -0 "$SERVER_PID" 2>/dev/null; do
+    command=""
+    if IFS= read -r -t 1 command; then
         case "$command" in
             MQTT_DEBUG)
                 echo "STDIN: running MQTT service diagnostic inside OTA add-on"
@@ -73,12 +73,11 @@ SERVER_PID=$!
                 echo "STDIN: unknown command: $command" >&2
                 ;;
         esac
-    done
-) &
-STDIN_PID=$!
+    fi
+done
 
-wait "$SERVER_PID"
-STATUS=$?
-kill "$STDIN_PID" "$MANUFACTURING_PID" "$MQTT_PID" "$OBSERVER_PID" 2>/dev/null || true
-wait "$STDIN_PID" "$MANUFACTURING_PID" "$MQTT_PID" "$OBSERVER_PID" 2>/dev/null || true
+wait "$SERVER_PID" || STATUS=$?
+STATUS=${STATUS:-0}
+kill "$MANUFACTURING_PID" "$MQTT_PID" "$OBSERVER_PID" 2>/dev/null || true
+wait "$MANUFACTURING_PID" "$MQTT_PID" "$OBSERVER_PID" 2>/dev/null || true
 exit "$STATUS"
