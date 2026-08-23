@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """Interactive launcher for test_ota_e2e_live.py from Home Assistant SSH.
 
-The SSH add-on has its own /data/options.json, so this launcher deliberately
-loads the OTA Server add-on options through the Supervisor API and injects them
-into the E2E and database layers. OTA HTTPS calls aimed by the core test at
-127.0.0.1 are redirected to the configured ota_host because OTA runs in a
-separate add-on container.
+The SSH add-on has its own /data/options.json and may not have permission to
+read Supervisor service credentials. This launcher loads OTA Server options
+through the Supervisor add-on API, injects them into the E2E/database layers,
+and uses the MQTT connection configured for OTA instead of /services/mqtt.
 """
 from __future__ import annotations
 
@@ -76,19 +75,45 @@ def ota_addon_options() -> dict:
     raise RuntimeError('OTA Server options could not be loaded from Supervisor API' + detail)
 
 
+def _secret_from_shared_file(name: str) -> str:
+    path = Path('/share/ota_server/secrets.json')
+    if not name or not path.is_file():
+        return ''
+    try:
+        data = json.loads(path.read_text(encoding='utf-8'))
+    except Exception:
+        return ''
+    for bucket_name in ('mqtt_passwords', 'database_passwords', 'mysql_passwords', 'secrets'):
+        bucket = data.get(bucket_name)
+        if isinstance(bucket, dict) and name in bucket:
+            return str(bucket[name])
+    value = data.get(name)
+    return str(value) if value is not None else ''
+
+
+def _mqtt_service_from_options(options: dict) -> dict:
+    secret_name = str(options.get('mqtt_password_secret') or '').strip()
+    password = os.environ.get('OTA_MQTT_PASSWORD', '') or _secret_from_shared_file(secret_name)
+    return {
+        'host': str(options.get('mqtt_host') or 'core-mosquitto').strip(),
+        'port': int(options.get('mqtt_port') or 1883),
+        'username': str(options.get('mqtt_username') or '').strip(),
+        'password': password,
+    }
+
+
 def install_ha_host_environment() -> None:
     options = ota_addon_options()
     ota_host = str(options.get('ota_host') or '').strip()
     if not ota_host:
         raise RuntimeError('ota_host is missing in OTA Server options')
 
-    # test_ota_e2e_live.main() and helper functions must see OTA add-on options,
-    # never the SSH add-on /data/options.json.
+    # All core E2E helpers must use OTA add-on configuration. In particular,
+    # mqtt_service() must not call Supervisor /services/mqtt: SSH add-ons often
+    # receive HTTP 403 for that endpoint even though they can inspect add-ons.
     e2e.load_options = lambda: dict(options)
+    e2e.mqtt_service = lambda: _mqtt_service_from_options(options)
 
-    # database.py was imported by test_ota_e2e_live before this launcher runs.
-    # Redirect its option source to the same resolved OTA options without
-    # touching persistent configuration or writing secrets.
     database_module = sys.modules.get('database')
     if database_module is not None:
         database_module.database_config = lambda: _database_config_from_options(options, database_module)
@@ -115,7 +140,7 @@ def install_ha_host_environment() -> None:
         return original_urlopen(url, *args, **kwargs)
 
     urllib.request.urlopen = redirected_urlopen
-    e2e.say(f'HA SSH network mode: OTA HTTPS 127.0.0.1 -> {ota_host}')
+    e2e.say(f'HA SSH network mode: OTA HTTPS 127.0.0.1 -> {ota_host}; MQTT from OTA options')
 
 
 def _database_config_from_options(options: dict, database_module) -> dict:
