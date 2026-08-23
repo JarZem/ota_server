@@ -18,6 +18,8 @@ static bool s_runtime_initialized;
 
 __attribute__((weak)) void jarzem_ota_hook_rx_from_ha(void) {}
 __attribute__((weak)) void jarzem_ota_hook_provision_step(void) {}
+__attribute__((weak)) void jarzem_ota_hook_radio_critical_enter(void) {}
+__attribute__((weak)) void jarzem_ota_hook_radio_critical_exit(void) {}
 
 static esp_err_t ensure_runtime_initialized(void)
 {
@@ -93,26 +95,26 @@ static esp_err_t add_ota_endpoints(esp_zb_ep_list_t *ep_list)
 static esp_err_t ota_action_handler(esp_zb_core_action_callback_id_t callback_id,
                                     const void *message)
 {
+    bool handled = false;
+    jarzem_ota_hook_radio_critical_enter();
     switch (callback_id) {
         case ESP_ZB_CORE_SET_ATTR_VALUE_CB_ID: {
             const esp_zb_zcl_set_attr_value_message_t *set =
                 (const esp_zb_zcl_set_attr_value_message_t *)message;
-            if (zigbee_ota_control_handle_set_attr(set) ||
-                zigbee_ota_cluster_handle_set_attr(set)) {
-                return ESP_OK;
-            }
+            handled = zigbee_ota_control_handle_set_attr(set) ||
+                      zigbee_ota_cluster_handle_set_attr(set);
             break;
         }
         case ESP_ZB_CORE_CMD_CUSTOM_CLUSTER_REQ_CB_ID:
-            if (zigbee_ota_cluster_handle_custom_cmd(
-                    (const esp_zb_zcl_custom_cluster_command_message_t *)message)) {
-                return ESP_OK;
-            }
+            handled = zigbee_ota_cluster_handle_custom_cmd(
+                (const esp_zb_zcl_custom_cluster_command_message_t *)message);
             break;
         default:
             break;
     }
+    jarzem_ota_hook_radio_critical_exit();
 
+    if (handled) return ESP_OK;
     return s_project_handler != NULL
                ? s_project_handler(callback_id, message)
                : ESP_OK;
