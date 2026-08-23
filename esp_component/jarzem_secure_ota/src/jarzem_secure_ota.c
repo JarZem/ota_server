@@ -11,15 +11,25 @@
 #include "zigbee_ota_cluster.h"
 #include "zigbee_ota_control.h"
 
+#undef esp_zb_zcl_custom_cluster_cmd_req
+
 static const char *TAG = "jarzem_secure_ota";
 static esp_zb_core_action_callback_t s_project_handler;
 static bool s_endpoints_added;
 static bool s_runtime_initialized;
 
 __attribute__((weak)) void jarzem_ota_hook_rx_from_ha(void) {}
+__attribute__((weak)) void jarzem_ota_hook_tx_to_ha(void) {}
 __attribute__((weak)) void jarzem_ota_hook_provision_step(void) {}
 __attribute__((weak)) void jarzem_ota_hook_radio_critical_enter(void) {}
 __attribute__((weak)) void jarzem_ota_hook_radio_critical_exit(void) {}
+
+uint8_t jarzem_ota_custom_cluster_cmd_req(esp_zb_zcl_custom_cluster_cmd_req_t *cmd)
+{
+    const uint8_t tsn = esp_zb_zcl_custom_cluster_cmd_req(cmd);
+    jarzem_ota_hook_tx_to_ha();
+    return tsn;
+}
 
 static esp_err_t ensure_runtime_initialized(void)
 {
