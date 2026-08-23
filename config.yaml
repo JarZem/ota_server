@@ -1,5 +1,5 @@
 name: "OTA Server"
-version: "0.1.33"
+version: "0.1.34"
 slug: "ota_server"
 description: "OTA server"
 
@@ -41,6 +41,8 @@ options:
   mqtt_host: "core-mosquitto"
   mqtt_port: 1883
   mqtt_base_topic: "zigbee2mqtt"
+  mqtt_username: ""
+  mqtt_password_secret: ""
   mysql_host: "core-mariadb"
   mysql_port: 3306
   mysql_database: homeassistant
@@ -58,6 +60,8 @@ schema:
   mqtt_host: str
   mqtt_port: int
   mqtt_base_topic: str
+  mqtt_username: str?
+  mqtt_password_secret: str?
   mysql_host: str
   mysql_port: int
   mysql_database: str
