@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """Interactive launcher for test_ota_e2e_live.py from Home Assistant SSH.
 
-Accepts both encrypted and unencrypted PEM private keys pasted directly into the
-terminal without putting CA secrets on a command line. Network calls that the
-core E2E test addresses to 127.0.0.1 are redirected to the configured ota_host,
-because the OTA server runs in a separate add-on container.
+The SSH add-on has its own /data/options.json, so this launcher deliberately
+loads the OTA Server add-on options through the Supervisor API and injects them
+into the E2E and database layers. OTA HTTPS calls aimed by the core test at
+127.0.0.1 are redirected to the configured ota_host because OTA runs in a
+separate add-on container.
 """
 from __future__ import annotations
 
 import json
+import os
 import queue
 import re
+import sys
 import urllib.request
 from pathlib import Path
 
@@ -18,11 +21,79 @@ import paho.mqtt.client as mqtt
 import test_ota_e2e_live as e2e
 
 
-def install_ha_host_url_redirect() -> None:
-    options = e2e.load_options()
+_OTA_OPTIONS: dict | None = None
+
+
+def supervisor_json(path: str) -> dict:
+    token = os.environ.get('SUPERVISOR_TOKEN', '')
+    if not token:
+        raise RuntimeError('SUPERVISOR_TOKEN is missing; SSH add-on must have Supervisor API access')
+    req = urllib.request.Request(
+        'http://supervisor' + path,
+        headers={'Authorization': f'Bearer {token}'},
+    )
+    with urllib.request.urlopen(req, timeout=30) as response:
+        return json.loads(response.read().decode('utf-8'))
+
+
+def ota_addon_options() -> dict:
+    global _OTA_OPTIONS
+    if _OTA_OPTIONS is not None:
+        return dict(_OTA_OPTIONS)
+
+    payload = supervisor_json('/addons')
+    data = payload.get('data', payload)
+    addons = data.get('addons') if isinstance(data, dict) else None
+    if not isinstance(addons, list):
+        raise RuntimeError('Supervisor /addons response does not contain an add-on list')
+
+    candidates: list[str] = []
+    for item in addons:
+        if not isinstance(item, dict):
+            continue
+        slug = str(item.get('slug') or '')
+        name = str(item.get('name') or '')
+        if 'ota_server' in slug.lower() or name.strip().lower() == 'ota server':
+            candidates.append(slug)
+
+    if not candidates:
+        raise RuntimeError('OTA Server add-on was not found through Supervisor API')
+
+    last_error: Exception | None = None
+    for slug in candidates:
+        try:
+            info_payload = supervisor_json(f'/addons/{slug}/info')
+            info = info_payload.get('data', info_payload)
+            options = info.get('options') if isinstance(info, dict) else None
+            if isinstance(options, dict) and options.get('ota_host'):
+                _OTA_OPTIONS = dict(options)
+                e2e.say(f'HA SSH mode: using OTA add-on {slug}; ota_host={options.get("ota_host")}')
+                return dict(_OTA_OPTIONS)
+        except Exception as exc:
+            last_error = exc
+
+    detail = f': {last_error}' if last_error else ''
+    raise RuntimeError('OTA Server options could not be loaded from Supervisor API' + detail)
+
+
+def install_ha_host_environment() -> None:
+    options = ota_addon_options()
     ota_host = str(options.get('ota_host') or '').strip()
     if not ota_host:
-        raise RuntimeError('ota_host is missing in OTA options')
+        raise RuntimeError('ota_host is missing in OTA Server options')
+
+    # test_ota_e2e_live.main() and helper functions must see OTA add-on options,
+    # never the SSH add-on /data/options.json.
+    e2e.load_options = lambda: dict(options)
+
+    # database.py was imported by test_ota_e2e_live before this launcher runs.
+    # Redirect its option source to the same resolved OTA options without
+    # touching persistent configuration or writing secrets.
+    database_module = sys.modules.get('database')
+    if database_module is not None:
+        database_module.database_config = lambda: _database_config_from_options(options, database_module)
+        if hasattr(database_module, '_engine'):
+            database_module._engine = None
 
     original_urlopen = urllib.request.urlopen
     source = 'https://127.0.0.1:'
@@ -44,7 +115,22 @@ def install_ha_host_url_redirect() -> None:
         return original_urlopen(url, *args, **kwargs)
 
     urllib.request.urlopen = redirected_urlopen
-    e2e.say(f'HA SSH network mode: OTA endpoints 127.0.0.1 -> {ota_host}')
+    e2e.say(f'HA SSH network mode: OTA HTTPS 127.0.0.1 -> {ota_host}')
+
+
+def _database_config_from_options(options: dict, database_module) -> dict:
+    secret_name = str(options.get('mysql_password_secret') or 'homeassistant_mysql').strip()
+    password = os.environ.get('OTA_MYSQL_PASSWORD', '') or database_module._secret(secret_name)
+    if not password:
+        raise RuntimeError(f'MySQL password secret {secret_name!r} is missing')
+    return {
+        'host': str(options.get('mysql_host') or 'core-mariadb').strip(),
+        'port': int(options.get('mysql_port') or 3306),
+        'database': str(options.get('mysql_database') or 'homeassistant').strip(),
+        'username': str(options.get('mysql_username') or 'homeassistant').strip(),
+        'password': password,
+        'password_secret': secret_name,
+    }
 
 
 def read_pem_any(label: str, _end_marker: str) -> bytes:
@@ -163,7 +249,7 @@ def verify_cleanup(device_id: str, compact: str, filename: str) -> None:
 e2e.read_pem = read_pem_any
 
 if __name__ == '__main__':
-    install_ha_host_url_redirect()
+    install_ha_host_environment()
     root = e2e.RESULT_ROOT
     root.mkdir(parents=True, exist_ok=True)
     before = {p for p in root.iterdir() if p.is_dir()}
