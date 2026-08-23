@@ -27,6 +27,14 @@ void jarzem_ota_action_handler_register(jarzem_ota_project_action_handler_t proj
 void jarzem_ota_hook_rx_from_ha(void);
 void jarzem_ota_hook_provision_step(void);
 
+/*
+ * Optional RF-critical hooks. A project may use them to suspend nonessential
+ * peripherals (for example WS2812/RMT output) while OTA Zigbee RX/TX is active.
+ * Implementations must support nested enter/exit pairs.
+ */
+void jarzem_ota_hook_radio_critical_enter(void);
+void jarzem_ota_hook_radio_critical_exit(void);
+
 #ifdef __cplusplus
 }
 #endif
