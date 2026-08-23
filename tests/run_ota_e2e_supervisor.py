@@ -32,6 +32,7 @@ SUPERVISOR = 'http://supervisor'
 DEFAULT_SLUG = 'local_ota_server'
 POLL_SECONDS = 0.7
 TIMEOUT_SECONDS = 300
+START_MARKER = 'STDIN: starting live OTA E2E test inside OTA add-on'
 
 
 def token() -> str:
@@ -66,9 +67,11 @@ def addon_logs(slug: str) -> str:
 
 
 def send_stdin(slug: str, text: str) -> None:
-    payload = text.encode('utf-8')
     response = supervisor_request(
-        f'/addons/{slug}/stdin', data=payload, content_type='text/plain; charset=utf-8')
+        f'/addons/{slug}/stdin',
+        data=text.encode('utf-8'),
+        content_type='text/plain; charset=utf-8',
+    )
     if response:
         parsed = json.loads(response.decode('utf-8'))
         if parsed.get('result') != 'ok':
@@ -96,21 +99,45 @@ def paste_pem(label: str, endings: set[str]) -> str:
             return '\n'.join(lines) + '\n'
 
 
-def wait_for(slug: str, marker: str, *, since: int = 0,
-             timeout: int = TIMEOUT_SECONDS) -> tuple[str, int]:
+def wait_for_new_occurrence(slug: str, marker: str, previous_count: int,
+                            timeout: int = TIMEOUT_SECONDS) -> tuple[str, int]:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         text = addon_logs(slug)
-        pos = text.find(marker, since)
-        if pos >= 0:
-            return text, pos
+        count = text.count(marker)
+        if count > previous_count:
+            return text, text.rfind(marker)
         time.sleep(POLL_SECONDS)
-    raise TimeoutError(f'timeout waiting for OTA log marker: {marker!r}')
+    text = addon_logs(slug)
+    tail = text[-4000:]
+    raise TimeoutError(
+        f'timeout waiting for new OTA log marker: {marker!r}; '
+        f'previous_count={previous_count} current_count={text.count(marker)}\n'
+        f'--- OTA LOG TAIL ---\n{tail}'
+    )
+
+
+def wait_for_after(slug: str, marker: str, start_marker: str,
+                   timeout: int = TIMEOUT_SECONDS) -> tuple[str, int]:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        text = addon_logs(slug)
+        start = text.rfind(start_marker)
+        if start >= 0:
+            pos = text.find(marker, start)
+            if pos >= 0:
+                return text, pos
+        time.sleep(POLL_SECONDS)
+    text = addon_logs(slug)
+    tail = text[-4000:]
+    raise TimeoutError(
+        f'timeout waiting for OTA log marker after current E2E start: {marker!r}\n'
+        f'--- OTA LOG TAIL ---\n{tail}'
+    )
 
 
 def newest_e2e_tail(text: str) -> str:
-    marker = 'STDIN: starting live OTA E2E test inside OTA add-on'
-    pos = text.rfind(marker)
+    pos = text.rfind(START_MARKER)
     return text[pos:] if pos >= 0 else text[-12000:]
 
 
@@ -123,14 +150,14 @@ def run(slug: str, ca_cert: str | None, ca_key: str | None,
         raise RuntimeError(f'OTA add-on {slug!r} does not have stdin enabled')
 
     initial_logs = addon_logs(slug)
-    initial_len = len(initial_logs)
+    previous_start_count = initial_logs.count(START_MARKER)
 
     print(f"OTA add-on {slug} version={info.get('version')} state={info.get('state')}")
     print('Starting E2E inside OTA add-on...')
     send_stdin(slug, 'RUN_E2E\n')
 
-    _, start_pos = wait_for(
-        slug, 'Paste Root CA certificate PEM.', since=initial_len, timeout=30)
+    wait_for_new_occurrence(slug, START_MARKER, previous_start_count, timeout=30)
+    wait_for_after(slug, 'Paste Root CA certificate PEM.', START_MARKER, timeout=30)
 
     cert_pem = (
         read_pem_file(ca_cert, 'certificate') if ca_cert else
@@ -138,8 +165,7 @@ def run(slug: str, ca_cert: str | None, ca_key: str | None,
     )
     send_stdin(slug, cert_pem)
 
-    _, key_prompt_pos = wait_for(
-        slug, 'Paste Root CA private key PEM.', since=start_pos, timeout=30)
+    wait_for_after(slug, 'Paste Root CA private key PEM.', START_MARKER, timeout=30)
 
     key_pem = (
         read_pem_file(ca_key, 'private key') if ca_key else
@@ -151,8 +177,8 @@ def run(slug: str, ca_cert: str | None, ca_key: str | None,
     )
     send_stdin(slug, key_pem)
 
-    _, password_prompt_pos = wait_for(
-        slug, 'Root CA private key password', since=key_prompt_pos, timeout=30)
+    _, password_prompt_pos = wait_for_after(
+        slug, 'Root CA private key password', START_MARKER, timeout=30)
 
     if password_env:
         password = os.environ.get(password_env)
@@ -167,9 +193,11 @@ def run(slug: str, ca_cert: str | None, ca_key: str | None,
     deadline = time.monotonic() + TIMEOUT_SECONDS
     while time.monotonic() < deadline:
         text = addon_logs(slug)
+        current_start = text.rfind(START_MARKER)
+        if current_start >= 0 and printed < current_start:
+            printed = current_start
         if len(text) > printed:
             chunk = text[printed:]
-            # Do not replay the password prompt; it is already represented locally.
             sys.stdout.write(chunk)
             if not chunk.endswith('\n'):
                 sys.stdout.write('\n')
