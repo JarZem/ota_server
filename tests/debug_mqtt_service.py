@@ -53,6 +53,71 @@ def secret_value(name: str) -> str:
     return str(value) if value is not None else ''
 
 
+def mosquitto_logins() -> list[tuple[str, str]]:
+    try:
+        payload = supervisor_json('/addons/core_mosquitto/info')
+    except Exception as exc:
+        print(f'Mosquitto add-on info unavailable: {exc}', flush=True)
+        return []
+    data = payload.get('data', payload)
+    options = data.get('options') if isinstance(data, dict) else None
+    logins = options.get('logins') if isinstance(options, dict) else None
+    result = []
+    if isinstance(logins, list):
+        for item in logins:
+            if not isinstance(item, dict):
+                continue
+            username = str(item.get('username') or '').strip()
+            password = str(item.get('password') or '')
+            if username and password:
+                result.append((username, password))
+    print(f'Mosquitto configured login count={len(result)} users={[u for u, _ in result]!r}', flush=True)
+    return result
+
+
+def try_connect(host: str, port: int, username: str, password: str, label: str) -> bool:
+    connected = threading.Event()
+    result = {'reason_code': None}
+    try:
+        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id='ota-e2e-mqtt-debug')
+    except (AttributeError, TypeError):
+        client = mqtt.Client(client_id='ota-e2e-mqtt-debug')
+    if username:
+        client.username_pw_set(username, password)
+
+    def on_connect(client, userdata, flags, reason_code, properties=None):
+        try:
+            code = int(reason_code)
+        except (TypeError, ValueError):
+            code = reason_code
+        result['reason_code'] = code
+        print(f'{label}: MQTT on_connect reason_code={reason_code!r} numeric={code!r}', flush=True)
+        connected.set()
+
+    client.on_connect = on_connect
+    try:
+        rc = client.connect(host, port, keepalive=30)
+        print(f'{label}: connect() rc={rc}', flush=True)
+        client.loop_start()
+        if not connected.wait(12):
+            print(f'{label}: FAIL no CONNACK/on_connect within 12 seconds', flush=True)
+            return False
+        if result['reason_code'] == 0:
+            print(f'{label}: PASS broker accepted connection', flush=True)
+            return True
+        print(f"{label}: FAIL broker rejected connection reason_code={result['reason_code']!r}", flush=True)
+        return False
+    finally:
+        try:
+            client.disconnect()
+        except Exception:
+            pass
+        try:
+            client.loop_stop()
+        except Exception:
+            pass
+
+
 def main() -> None:
     print('TEST OTA MQTT credentials from SSH context', flush=True)
     options = ota_options()
@@ -68,50 +133,23 @@ def main() -> None:
         flush=True,
     )
 
-    if not username:
-        print('FAIL mqtt_username is empty in OTA add-on options', flush=True)
+    if username and password:
+        if try_connect(host, port, username, password, 'OTA options'):
+            return
+    else:
+        print('OTA options do not currently contain usable MQTT credentials', flush=True)
+
+    logins = mosquitto_logins()
+    if not logins:
+        print('FAIL no explicit Mosquitto login credentials are available through Supervisor', flush=True)
         return
-    if not password:
-        print('FAIL MQTT password is unavailable: set mqtt_password_secret to a key present in /share/ota_server/secrets.json', flush=True)
-        return
 
-    connected = threading.Event()
-    result = {'reason_code': None}
-    try:
-        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id='ota-e2e-mqtt-debug')
-    except (AttributeError, TypeError):
-        client = mqtt.Client(client_id='ota-e2e-mqtt-debug')
-    client.username_pw_set(username, password)
+    for candidate_user, candidate_password in logins:
+        if try_connect(host, port, candidate_user, candidate_password, f'Mosquitto login {candidate_user!r}'):
+            print(f'PASS usable MQTT login found username={candidate_user!r}; password intentionally not printed', flush=True)
+            return
 
-    def on_connect(client, userdata, flags, reason_code, properties=None):
-        try:
-            code = int(reason_code)
-        except (TypeError, ValueError):
-            code = reason_code
-        result['reason_code'] = code
-        print(f'MQTT on_connect reason_code={reason_code!r} numeric={code!r}', flush=True)
-        connected.set()
-
-    client.on_connect = on_connect
-    try:
-        rc = client.connect(host, port, keepalive=30)
-        print(f'MQTT connect() returned rc={rc}', flush=True)
-        client.loop_start()
-        if not connected.wait(12):
-            print('FAIL no CONNACK/on_connect received within 12 seconds', flush=True)
-        elif result['reason_code'] == 0:
-            print('PASS MQTT connection accepted by broker', flush=True)
-        else:
-            print(f"FAIL broker rejected MQTT connection reason_code={result['reason_code']!r}", flush=True)
-    finally:
-        try:
-            client.disconnect()
-        except Exception:
-            pass
-        try:
-            client.loop_stop()
-        except Exception:
-            pass
+    print('FAIL none of the configured Mosquitto login accounts could connect', flush=True)
 
 
 if __name__ == '__main__':
