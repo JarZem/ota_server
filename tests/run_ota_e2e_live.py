@@ -1,20 +1,50 @@
 #!/usr/bin/env python3
-"""Interactive launcher for test_ota_e2e_live.py.
+"""Interactive launcher for test_ota_e2e_live.py from Home Assistant SSH.
 
 Accepts both encrypted and unencrypted PEM private keys pasted directly into the
-Home Assistant add-on terminal without putting CA secrets on a command line.
-After the protocol test it requires diagnostic logs and proves that successful
-cleanup left no virtual ESP, firmware or external converter active.
+terminal without putting CA secrets on a command line. Network calls that the
+core E2E test addresses to 127.0.0.1 are redirected to the configured ota_host,
+because the OTA server runs in a separate add-on container.
 """
 from __future__ import annotations
 
 import json
 import queue
 import re
+import urllib.request
 from pathlib import Path
 
 import paho.mqtt.client as mqtt
 import test_ota_e2e_live as e2e
+
+
+def install_ha_host_url_redirect() -> None:
+    options = e2e.load_options()
+    ota_host = str(options.get('ota_host') or '').strip()
+    if not ota_host:
+        raise RuntimeError('ota_host is missing in OTA options')
+
+    original_urlopen = urllib.request.urlopen
+    source = 'https://127.0.0.1:'
+    target = f'https://{ota_host}:'
+
+    def redirected_urlopen(url, *args, **kwargs):
+        if isinstance(url, urllib.request.Request):
+            old_url = url.full_url
+            new_url = old_url.replace(source, target, 1) if old_url.startswith(source) else old_url
+            if new_url != old_url:
+                url = urllib.request.Request(
+                    new_url,
+                    data=url.data,
+                    headers=dict(url.header_items()),
+                    method=url.get_method(),
+                )
+        elif isinstance(url, str) and url.startswith(source):
+            url = url.replace(source, target, 1)
+        return original_urlopen(url, *args, **kwargs)
+
+    urllib.request.urlopen = redirected_urlopen
+    e2e.say(f'HA SSH network mode: OTA endpoints 127.0.0.1 -> {ota_host}')
 
 
 def read_pem_any(label: str, _end_marker: str) -> bytes:
@@ -84,9 +114,13 @@ def loaded_converter_names() -> set[str]:
         client = mqtt.Client(client_id='ota-e2e-cleanup-check')
     if service['username']:
         client.username_pw_set(service['username'], service['password'])
+
     def on_message(_client, _userdata, message):
-        try: q.put(json.loads(message.payload.decode('utf-8')))
-        except Exception: pass
+        try:
+            q.put(json.loads(message.payload.decode('utf-8')))
+        except Exception:
+            pass
+
     client.on_message = on_message
     client.connect(service['host'], service['port'], 30)
     client.subscribe(f"{e2e.load_options().get('mqtt_base_topic') or 'zigbee2mqtt'}/bridge/converters")
@@ -94,7 +128,8 @@ def loaded_converter_names() -> set[str]:
     try:
         payload = q.get(timeout=10)
     finally:
-        client.disconnect(); client.loop_stop()
+        client.disconnect()
+        client.loop_stop()
     names = set()
     if isinstance(payload, list):
         for item in payload:
@@ -128,6 +163,7 @@ def verify_cleanup(device_id: str, compact: str, filename: str) -> None:
 e2e.read_pem = read_pem_any
 
 if __name__ == '__main__':
+    install_ha_host_url_redirect()
     root = e2e.RESULT_ROOT
     root.mkdir(parents=True, exist_ok=True)
     before = {p for p in root.iterdir() if p.is_dir()}
