@@ -13,6 +13,7 @@ from database import db_connect
 
 ROOT_CA_PATH = Path('/share/ota_server/cert/root_ca_cert.pem')
 URI_PREFIX = 'urn:jarzem:esp:pki:'
+DEVICE_CERT_TABLE = 'ota_server_device_certificates'
 
 
 def normalize_device_id(value: str) -> str:
@@ -126,7 +127,7 @@ def register_device_certificate(certificate_pem: bytes) -> dict:
 
     with db_connect() as conn:
         existing = conn.execute(
-            'SELECT certificate_fingerprint, registered_at FROM device_certificates WHERE device_id = ?',
+            f'SELECT certificate_fingerprint, registered_at FROM {DEVICE_CERT_TABLE} WHERE device_id = ?',
             (record['device_id'],),
         ).fetchone()
 
@@ -134,8 +135,8 @@ def register_device_certificate(certificate_pem: bytes) -> dict:
             action = 'REGISTERED'
             registered_at = now
             conn.execute(
-                '''
-                INSERT INTO device_certificates (
+                f'''
+                INSERT INTO {DEVICE_CERT_TABLE} (
                     device_id, ecosystem, device_group, device_model, product_role,
                     hardware_revision, chip_family, flash_size, certificate_pem,
                     certificate_fingerprint, public_key_der, public_key_uncompressed,
@@ -157,15 +158,15 @@ def register_device_certificate(certificate_pem: bytes) -> dict:
             action = 'UNCHANGED'
             registered_at = int(existing['registered_at'])
             conn.execute(
-                'UPDATE device_certificates SET updated_at = ? WHERE device_id = ?',
+                f'UPDATE {DEVICE_CERT_TABLE} SET updated_at = ? WHERE device_id = ?',
                 (now, record['device_id']),
             )
         else:
             action = 'REPLACED'
             registered_at = int(existing['registered_at'])
             conn.execute(
-                '''
-                UPDATE device_certificates SET
+                f'''
+                UPDATE {DEVICE_CERT_TABLE} SET
                     ecosystem=?, device_group=?, device_model=?, product_role=?,
                     hardware_revision=?, chip_family=?, flash_size=?, certificate_pem=?,
                     certificate_fingerprint=?, public_key_der=?, public_key_uncompressed=?,
@@ -194,7 +195,7 @@ def get_registered_device(device_id: str) -> dict | None:
     normalized = normalize_device_id(device_id)
     with db_connect() as conn:
         row = conn.execute(
-            'SELECT * FROM device_certificates WHERE device_id=?',
+            f'SELECT * FROM {DEVICE_CERT_TABLE} WHERE device_id=?',
             (normalized,),
         ).fetchone()
     return dict(row) if row else None
@@ -203,12 +204,13 @@ def get_registered_device(device_id: str) -> dict | None:
 def list_registered_devices() -> list[dict]:
     with db_connect() as conn:
         rows = conn.execute(
-            '''
+            f'''
             SELECT device_id, ecosystem, device_group, device_model, product_role,
                    hardware_revision, chip_family, flash_size, certificate_fingerprint,
                    certificate_not_before, certificate_not_after, last_hello_counter,
+                   last_status_counter, running_firmware_version, last_status_at,
                    registered_at, updated_at
-            FROM device_certificates
+            FROM {DEVICE_CERT_TABLE}
             ORDER BY device_id
             '''
         ).fetchall()
@@ -216,12 +218,6 @@ def list_registered_devices() -> list[dict]:
 
 
 def accept_hello_counter(device_id: str, counter: int) -> bool:
-    """Atomically accept any strictly newer counter.
-
-    Gaps are intentionally allowed. A lost HELLO, reboot after NVS increment, or
-    network reordering therefore cannot brick enrollment. A late lower/equal
-    counter is simply stale/replay and is ignored.
-    """
     normalized = normalize_device_id(device_id)
     if counter <= 0:
         return False
@@ -229,11 +225,29 @@ def accept_hello_counter(device_id: str, counter: int) -> bool:
     now = int(datetime.now(timezone.utc).timestamp())
     with db_connect() as conn:
         result = conn.execute(
-            '''
-            UPDATE device_certificates
+            f'''
+            UPDATE {DEVICE_CERT_TABLE}
             SET last_hello_counter=?, updated_at=?
             WHERE device_id=? AND last_hello_counter < ?
             ''',
             (counter, now, normalized, counter),
+        )
+        return result.rowcount == 1
+
+
+def accept_status_counter(device_id: str, counter: int, firmware_version: str) -> bool:
+    normalized = normalize_device_id(device_id)
+    if counter <= 0 or not firmware_version:
+        return False
+
+    now = int(datetime.now(timezone.utc).timestamp())
+    with db_connect() as conn:
+        result = conn.execute(
+            f'''
+            UPDATE {DEVICE_CERT_TABLE}
+            SET last_status_counter=?, running_firmware_version=?, last_status_at=?, updated_at=?
+            WHERE device_id=? AND last_status_counter < ?
+            ''',
+            (counter, firmware_version, now, now, normalized, counter),
         )
         return result.rowcount == 1
