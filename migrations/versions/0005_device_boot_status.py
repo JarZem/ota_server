@@ -8,14 +8,16 @@ down_revision = '0004_activity_log'
 branch_labels = None
 depends_on = None
 
+TABLE = 'ota_server_device_certificates'
+
 
 def upgrade() -> None:
-    op.add_column('device_certificates', sa.Column('last_status_counter', sa.BigInteger(), nullable=False, server_default='0'))
-    op.add_column('device_certificates', sa.Column('running_firmware_version', sa.String(64), nullable=False, server_default=''))
-    op.add_column('device_certificates', sa.Column('last_status_at', sa.BigInteger(), nullable=False, server_default='0'))
+    op.add_column(TABLE, sa.Column('last_status_counter', sa.BigInteger(), nullable=False, server_default='0'))
+    op.add_column(TABLE, sa.Column('running_firmware_version', sa.String(64), nullable=False, server_default=''))
+    op.add_column(TABLE, sa.Column('last_status_at', sa.BigInteger(), nullable=False, server_default='0'))
 
 
 def downgrade() -> None:
-    op.drop_column('device_certificates', 'last_status_at')
-    op.drop_column('device_certificates', 'running_firmware_version')
-    op.drop_column('device_certificates', 'last_status_counter')
+    op.drop_column(TABLE, 'last_status_at')
+    op.drop_column(TABLE, 'running_firmware_version')
+    op.drop_column(TABLE, 'last_status_counter')
