@@ -23,6 +23,7 @@ add_custom_target(jarzem_ota_z2m_bundle ALL
             --project "${JARZEM_OTA_PROJECT_ROOT}"
             --submodule "${JARZEM_OTA_REPO_ROOT}"
             --output "${CMAKE_BINARY_DIR}/zigbee2mqtt"
+            --version "${PROJECT_VER}"
     COMMENT "Preparing Zigbee2MQTT converter bundle"
     VERBATIM
 )
