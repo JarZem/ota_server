@@ -10,8 +10,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 
-from database import db_connect
-from device_registry import get_registered_device, normalize_device_id
+from device_registry import accept_status_counter, get_registered_device, normalize_device_id
 
 OPTIONS_PATH = '/data/options.json'
 SUPERVISOR_TOKEN = os.environ.get('SUPERVISOR_TOKEN', '')
@@ -95,16 +94,8 @@ def verify_and_store(topic_device, payload, expected_ecosystem):
     canonical = f'S|{device_id}|{counter}|{fw_version}'.encode('ascii')
     public_key.verify(encode_dss_signature(r, s), canonical, ec.ECDSA(hashes.SHA256()))
 
-    with db_connect() as conn:
-        result = conn.execute(
-            '''UPDATE device_certificates
-               SET last_status_counter=?, running_firmware_version=?, last_status_at=?, updated_at=?
-               WHERE device_id=? AND last_status_counter < ?''',
-            (counter, fw_version, now, now, device_id, counter),
-        )
-        if result.rowcount != 1:
-            return False, device_id, counter, fw_version
-    return True, device_id, counter, fw_version
+    accepted = accept_status_counter(device_id, counter, fw_version)
+    return accepted, device_id, counter, fw_version
 
 
 def main():
