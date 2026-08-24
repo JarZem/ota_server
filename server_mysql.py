@@ -5,6 +5,7 @@ import re
 import server
 from activity import firmware_device_state, render_ingress_tables
 from database import assert_schema_current, database_summary, db_connect
+from device_registry import list_registered_devices
 from firmware_publish import handle_publish
 from zigbee2mqtt_publish import handle_zigbee2mqtt_publish
 from ota_check_runtime import (
@@ -30,6 +31,112 @@ server.ota_create_token = create_dispatch_token
 server.ota_validate_token = validate_dispatch_token
 server.make_provision_payload = make_noop_provision_payload
 server.make_ota_check_payload = make_check_payload
+
+
+def get_ota_devices_from_ha():
+    """Read live device identity from Home Assistant Device Registry.
+
+    HA is authoritative for runtime-facing fields such as name, transport,
+    model/model_id, hardware version and software version. Security identity
+    remains in OTA device_certificates.
+    """
+    devices = server.ha_ws_command({"type": "config/device_registry/list"})
+    result = []
+
+    for device in devices:
+        if not server.device_matches_model(device):
+            continue
+
+        transport = None
+        ieee = None
+        mqtt_topic_name = None
+        for identifier in device.get("identifiers", []):
+            if not isinstance(identifier, (list, tuple)) or len(identifier) < 2:
+                continue
+            domain = str(identifier[0]).lower()
+            value = str(identifier[1])
+            if domain == "zha":
+                candidate = server.normalize_ieee(value)
+                if re.fullmatch(r"[0-9a-f]{2}(?::[0-9a-f]{2}){7}", candidate):
+                    transport = server.TRANSPORT_ZHA
+                    ieee = candidate
+                    break
+            if domain == "mqtt" and value.startswith("zigbee2mqtt_"):
+                topic_name = value[len("zigbee2mqtt_"):]
+                candidate = server.normalize_ieee(topic_name)
+                if re.fullmatch(r"[0-9a-f]{2}(?::[0-9a-f]{2}){7}", candidate):
+                    transport = server.TRANSPORT_ZIGBEE2MQTT
+                    ieee = candidate
+                    mqtt_topic_name = server.ieee_to_z2m_topic_name(topic_name)
+                    break
+
+        if not ieee:
+            continue
+
+        model = str(device.get("model") or "")
+        model_id = str(device.get("model_id") or "")
+        result.append({
+            "device_id": device.get("id"),
+            "ieee": ieee,
+            "name": str(device.get("name_by_user") or device.get("name") or model_id or model or ieee),
+            "model": model,
+            "model_id": model_id,
+            "manufacturer": str(device.get("manufacturer") or ""),
+            "hw_version": str(device.get("hw_version") or ""),
+            "sw_version": str(device.get("sw_version") or ""),
+            "serial_number": str(device.get("serial_number") or ""),
+            "transport": transport,
+            "mqtt_topic_name": mqtt_topic_name,
+        })
+
+    result.sort(key=lambda x: (x["name"].lower(), x["transport"] or "", x["ieee"]))
+    return result
+
+
+server.get_ota_devices = get_ota_devices_from_ha
+server.get_zha_devices = get_ota_devices_from_ha
+
+
+def merged_device_records():
+    """Merge HA live metadata with the CA-backed OTA security registry.
+
+    Never infer a registered ESP identity from a firmware BIN. HA supplies
+    model/HW/FW; device_certificates supplies role, certificate fingerprint and
+    authenticated HELLO state.
+    """
+    ha_map = {d["ieee"]: d for d in get_ota_devices_from_ha()}
+    cert_map = {d["device_id"]: d for d in list_registered_devices()}
+    result = []
+
+    for device_id in sorted(set(ha_map) | set(cert_map)):
+        ha = ha_map.get(device_id, {})
+        cert = cert_map.get(device_id, {})
+        last_hello = int(cert.get("last_hello_counter") or 0)
+        if cert:
+            state = server.DEVICE_STATE_AUTHENTICATED if last_hello > 0 else "CERT_REGISTERED"
+        else:
+            state = server.DEVICE_STATE_DISCOVERED
+
+        result.append({
+            "device_id": device_id,
+            "zigbee_ieee": device_id,
+            "state": state,
+            "ota_ecosystem": cert.get("ecosystem") or server.runtime_config["ota"]["ecosystem"],
+            "device_model": ha.get("model_id") or ha.get("model") or cert.get("device_model") or "unknown",
+            "product_role": cert.get("product_role") or "unknown",
+            "hardware_revision": ha.get("hw_version") or cert.get("hardware_revision") or "unknown",
+            "chip_family": cert.get("chip_family") or "unknown",
+            "flash_size": cert.get("flash_size") or "unknown",
+            "firmware_version": ha.get("sw_version") or "",
+            "firmware_product": ha.get("model_id") or ha.get("model") or cert.get("device_model") or "unknown",
+            "firmware_channel": "stable",
+            "device_public_key_fingerprint": cert.get("certificate_fingerprint") or "",
+            "enrollment_counter": last_hello,
+        })
+    return result
+
+
+server.list_device_records = merged_device_records
 
 _original_write_ota_payload_to_zigbee = server.write_ota_payload_to_zigbee
 
@@ -89,49 +196,23 @@ def page_html(message=""):
 
     top_style = f'''<style>
 {lifecycle_style}
-.ota-main-tabs {{
-    display:flex;
-    flex-wrap:wrap;
-    gap:6px;
-    margin:12px 0 18px;
-    border-bottom:1px solid #888;
-    padding-bottom:6px;
-}}
-.ota-main-tab {{
-    margin:0;
-    padding:7px 12px;
-    border:1px solid #777;
-    border-radius:4px 4px 0 0;
-    background:#222;
-    color:#ddd;
-    cursor:pointer;
-}}
-.ota-main-tab.active {{ background:#ddd; color:#111; }}
-.ota-main-panel {{ display:none; }}
-.ota-main-panel.active {{ display:block; }}
+.ota-main-tabs {{display:flex;flex-wrap:wrap;gap:6px;margin:12px 0 18px;border-bottom:1px solid #888;padding-bottom:6px}}
+.ota-main-tab {{margin:0;padding:7px 12px;border:1px solid #777;border-radius:4px 4px 0 0;background:#222;color:#ddd;cursor:pointer}}
+.ota-main-tab.active {{background:#ddd;color:#111}}
+.ota-main-panel {{display:none}}
+.ota-main-panel.active {{display:block}}
 </style>'''
 
     body = body.replace('</head>', top_style + '\n</head>', 1)
     body = body.replace('<h2>ESP OTA Server</h2>', '<h2>ESP OTA Server</h2>\n' + nav, 1)
-
-    body = body.replace(
-        '<h3>Firmware biny</h3>',
-        '<section class="ota-main-panel active" data-main-panel="images">\n<h3>Firmware biny</h3>',
-        1,
-    )
-    body = body.replace(
-        '<h3>Registrované ESP moduly</h3>',
-        '</section>\n<section class="ota-main-panel" data-main-panel="esp">\n<h3>Registrované ESP moduly</h3>',
-        1,
-    )
+    body = body.replace('<h3>Firmware biny</h3>', '<section class="ota-main-panel active" data-main-panel="images">\n<h3>Firmware biny</h3>', 1)
+    body = body.replace('<h3>Registrované ESP moduly</h3>', '</section>\n<section class="ota-main-panel" data-main-panel="esp">\n<h3>Registrované ESP moduly</h3>', 1)
 
     extra_panels = []
     for key in ('activity', 'artifacts', 'provisioning', 'firmware'):
         content = lifecycle_panels.get(key)
         if content:
-            extra_panels.append(
-                f'<section class="ota-main-panel" data-main-panel="{key}">{content}</section>'
-            )
+            extra_panels.append(f'<section class="ota-main-panel" data-main-panel="{key}">{content}</section>')
 
     script = '''
 <script>
@@ -147,12 +228,7 @@ document.querySelectorAll('.ota-filter').forEach(button => button.addEventListen
 }));
 </script>
 '''
-
-    body = body.replace(
-        '</body>',
-        '</section>\n' + '\n'.join(extra_panels) + script + '\n</body>',
-        1,
-    )
+    body = body.replace('</body>', '</section>\n' + '\n'.join(extra_panels) + script + '\n</body>', 1)
     return body
 
 
@@ -178,15 +254,8 @@ class SecureOTAHandler(server.OTAHandler):
                 self.activity_device_id = device_id
                 self.activity_image = image
                 self.activity_code = code
-                firmware_device_state(
-                    device_id=device_id, sha256=image["sha256"], filename=image["filename"],
-                    version=str(image.get("version") or "unknown"), code=code,
-                    state="DOWNLOAD_STARTED",
-                )
-                print(
-                    f"OTA download started device_id={device_id} filename={image['filename']} sha256={image['sha256'][:12]}",
-                    flush=True,
-                )
+                firmware_device_state(device_id=device_id, sha256=image["sha256"], filename=image["filename"], version=str(image.get("version") or "unknown"), code=code, state="DOWNLOAD_STARTED")
+                print(f"OTA download started device_id={device_id} filename={image['filename']} sha256={image['sha256'][:12]}", flush=True)
         return super().do_GET()
 
     def copyfile(self, source, outputfile):
@@ -207,17 +276,9 @@ class SecureOTAHandler(server.OTAHandler):
             device_id = self.activity_device_id
             if image and device_id:
                 if completed:
-                    firmware_device_state(
-                        device_id=device_id, sha256=image["sha256"], filename=image["filename"],
-                        version=str(image.get("version") or "unknown"), code=self.activity_code,
-                        state="DOWNLOAD_COMPLETED",
-                    )
+                    firmware_device_state(device_id=device_id, sha256=image["sha256"], filename=image["filename"], version=str(image.get("version") or "unknown"), code=self.activity_code, state="DOWNLOAD_COMPLETED")
                 elif transfer_error:
-                    firmware_device_state(
-                        device_id=device_id, sha256=image["sha256"], filename=image["filename"],
-                        version=str(image.get("version") or "unknown"), code=self.activity_code,
-                        state="DOWNLOAD_FAILED", error=transfer_error,
-                    )
+                    firmware_device_state(device_id=device_id, sha256=image["sha256"], filename=image["filename"], version=str(image.get("version") or "unknown"), code=self.activity_code, state="DOWNLOAD_FAILED", error=transfer_error)
 
             if completed and self.ota_sha256:
                 auth = self.headers.get("Authorization") or ""
@@ -225,11 +286,7 @@ class SecureOTAHandler(server.OTAHandler):
                 if auth.startswith("Bearer ") and device_id:
                     token = auth[7:].strip()
                     consumed = consume_dispatch_token(token, device_id, self.ota_sha256)
-                    print(
-                        f"OTA download grant {'consumed' if consumed else 'already-consumed/expired'} "
-                        f"device_id={device_id} sha256={self.ota_sha256[:12]}",
-                        flush=True,
-                    )
+                    print(f"OTA download grant {'consumed' if consumed else 'already-consumed/expired'} device_id={device_id} sha256={self.ota_sha256[:12]}", flush=True)
 
     def do_POST(self):
         parsed = server.urllib.parse.urlparse(self.path)
