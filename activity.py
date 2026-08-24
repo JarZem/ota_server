@@ -130,10 +130,10 @@ def _e(value) -> str:
 
 def render_ingress_tables() -> str:
     with db_connect() as conn:
-        events = conn.execute("SELECT * FROM activity_log ORDER BY created_at DESC, id DESC LIMIT 500").fetchall()
-        artifacts = conn.execute("SELECT * FROM artifact_publications ORDER BY published_at DESC LIMIT 50").fetchall()
-        provisioning = conn.execute("SELECT * FROM provisioning_attempts ORDER BY updated_at DESC LIMIT 100").fetchall()
-        device_fw = conn.execute("SELECT * FROM device_firmware_status ORDER BY updated_at DESC LIMIT 200").fetchall()
+        events = conn.execute("SELECT * FROM activity_log ORDER BY created_at DESC, id DESC LIMIT 100").fetchall()
+        artifacts = conn.execute("SELECT * FROM artifact_publications ORDER BY published_at DESC, id DESC LIMIT 100").fetchall()
+        provisioning = conn.execute("SELECT * FROM provisioning_attempts ORDER BY updated_at DESC, id DESC LIMIT 100").fetchall()
+        device_fw = conn.execute("SELECT * FROM device_firmware_status ORDER BY updated_at DESC, id DESC LIMIT 100").fetchall()
 
     event_rows = ''.join(
         '<tr class="ota-event ota-cat-{cat} ota-sev-{sev}" data-cat="{cat}"><td class="ota-time">{time}</td><td><span class="ota-badge">{cat}</span></td><td>{action}</td><td><code>{dev}</code></td><td>{detail}</td></tr>'.format(
@@ -152,13 +152,36 @@ def render_ingress_tables() -> str:
 
     return f'''
 <style>
-.ota-log-toolbar{{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0 10px}} .ota-filter{{border:1px solid #666;border-radius:4px;padding:3px 8px;background:#222;color:#ddd;cursor:pointer}}
-.ota-filter.active{{background:#ddd;color:#111}} .ota-log table{{font-size:12px}} .ota-log td{{padding:3px 6px;vertical-align:top}} .ota-time{{white-space:nowrap;font-family:monospace}}
-.ota-badge{{font-weight:700}} .ota-cat-REG .ota-badge{{color:#6cf}} .ota-cat-BIN .ota-badge{{color:#7ee787}} .ota-cat-MJS .ota-badge{{color:#d2a8ff}}
-.ota-cat-PROV .ota-badge{{color:#ffa657}} .ota-cat-CHECK .ota-badge{{color:#79c0ff}} .ota-cat-DOWNLOAD .ota-badge{{color:#3fb950}} .ota-cat-MQTT .ota-badge{{color:#a5d6ff}}
-.ota-sev-error td{{background:rgba(248,81,73,.16)}} details.ota-detail{{margin-top:12px}} details.ota-detail summary{{cursor:pointer;font-weight:600}}
+.ota-tabs{{display:flex;flex-wrap:wrap;gap:6px;margin:14px 0 10px;border-bottom:1px solid #666;padding-bottom:6px}}
+.ota-tab{{border:1px solid #666;border-radius:4px 4px 0 0;padding:6px 10px;background:#222;color:#ddd;cursor:pointer}}
+.ota-tab.active{{background:#ddd;color:#111}}
+.ota-tab-panel{{display:none}}
+.ota-tab-panel.active{{display:block}}
+.ota-log-toolbar{{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0 10px}}
+.ota-filter{{border:1px solid #666;border-radius:4px;padding:3px 8px;background:#222;color:#ddd;cursor:pointer}}
+.ota-filter.active{{background:#ddd;color:#111}}
+.ota-log table{{font-size:12px}}
+.ota-log td{{padding:3px 6px;vertical-align:top}}
+.ota-time{{white-space:nowrap;font-family:monospace}}
+.ota-badge{{font-weight:700}}
+.ota-cat-REG .ota-badge{{color:#6cf}}
+.ota-cat-BIN .ota-badge{{color:#7ee787}}
+.ota-cat-MJS .ota-badge{{color:#d2a8ff}}
+.ota-cat-PROV .ota-badge{{color:#ffa657}}
+.ota-cat-CHECK .ota-badge{{color:#79c0ff}}
+.ota-cat-DOWNLOAD .ota-badge{{color:#3fb950}}
+.ota-cat-MQTT .ota-badge{{color:#a5d6ff}}
+.ota-sev-error td{{background:rgba(248,81,73,.16)}}
 </style>
-<h3>OTA activity</h3>
+<div class="ota-tabs">
+<button type="button" class="ota-tab active" data-tab="activity">OTA activity</button>
+<button type="button" class="ota-tab" data-tab="artifacts">Published BIN / MJS detail</button>
+<button type="button" class="ota-tab" data-tab="provisioning">Provisioning detail</button>
+<button type="button" class="ota-tab" data-tab="firmware">ESP × firmware detail</button>
+</div>
+
+<section class="ota-tab-panel active" data-panel="activity">
+<h3>OTA activity — posledních 100</h3>
 <div class="ota-log-toolbar">
 <button type="button" class="ota-filter active" data-filter="ALL">ALL</button><button type="button" class="ota-filter" data-filter="REG">REG</button>
 <button type="button" class="ota-filter" data-filter="BIN">BIN</button><button type="button" class="ota-filter" data-filter="MJS">MJS</button>
@@ -166,8 +189,33 @@ def render_ingress_tables() -> str:
 <button type="button" class="ota-filter" data-filter="DOWNLOAD">DOWNLOAD</button><button type="button" class="ota-filter" data-filter="MQTT">MQTT</button>
 </div>
 <div class="table-wrap ota-log"><table><thead><tr><th>Time</th><th>What</th><th>Event</th><th>ESP</th><th>Detail</th></tr></thead><tbody>{event_rows}</tbody></table></div>
-<script>document.querySelectorAll('.ota-filter').forEach(b=>b.addEventListener('click',()=>{{const f=b.dataset.filter;document.querySelectorAll('.ota-filter').forEach(x=>x.classList.toggle('active',x===b));document.querySelectorAll('.ota-event').forEach(r=>r.style.display=(f==='ALL'||r.dataset.cat===f)?'':'none');}}));</script>
-<details class="ota-detail"><summary>Published BIN / MJS detail</summary><div class="table-wrap"><table><thead><tr><th>Time</th><th>Build</th><th>BIN SHA</th><th>BIN</th><th>MJS</th><th>Z2M</th></tr></thead><tbody>{artifact_rows}</tbody></table></div></details>
-<details class="ota-detail"><summary>Provisioning detail</summary><div class="table-wrap"><table><thead><tr><th>Time</th><th>ESP</th><th>Counter</th><th>State</th><th>Error</th></tr></thead><tbody>{provisioning_rows}</tbody></table></div></details>
-<details class="ota-detail"><summary>ESP × firmware detail</summary><div class="table-wrap"><table><thead><tr><th>Time</th><th>ESP</th><th>Build</th><th>BIN</th><th>SHA</th><th>State</th><th>Error</th></tr></thead><tbody>{firmware_rows}</tbody></table></div></details>
+</section>
+
+<section class="ota-tab-panel" data-panel="artifacts">
+<h3>Published BIN / MJS detail — posledních 100</h3>
+<div class="table-wrap"><table><thead><tr><th>Time</th><th>Build</th><th>BIN SHA</th><th>BIN</th><th>MJS</th><th>Z2M</th></tr></thead><tbody>{artifact_rows}</tbody></table></div>
+</section>
+
+<section class="ota-tab-panel" data-panel="provisioning">
+<h3>Provisioning detail — posledních 100</h3>
+<div class="table-wrap"><table><thead><tr><th>Time</th><th>ESP</th><th>Counter</th><th>State</th><th>Error</th></tr></thead><tbody>{provisioning_rows}</tbody></table></div>
+</section>
+
+<section class="ota-tab-panel" data-panel="firmware">
+<h3>ESP × firmware detail — posledních 100</h3>
+<div class="table-wrap"><table><thead><tr><th>Time</th><th>ESP</th><th>Build</th><th>BIN</th><th>SHA</th><th>State</th><th>Error</th></tr></thead><tbody>{firmware_rows}</tbody></table></div>
+</section>
+
+<script>
+document.querySelectorAll('.ota-tab').forEach(b=>b.addEventListener('click',()=>{{
+    const tab=b.dataset.tab;
+    document.querySelectorAll('.ota-tab').forEach(x=>x.classList.toggle('active',x===b));
+    document.querySelectorAll('.ota-tab-panel').forEach(p=>p.classList.toggle('active',p.dataset.panel===tab));
+}}));
+document.querySelectorAll('.ota-filter').forEach(b=>b.addEventListener('click',()=>{{
+    const f=b.dataset.filter;
+    document.querySelectorAll('.ota-filter').forEach(x=>x.classList.toggle('active',x===b));
+    document.querySelectorAll('.ota-event').forEach(r=>r.style.display=(f==='ALL'||r.dataset.cat===f)?'':'none');
+}}));
+</script>
 '''
