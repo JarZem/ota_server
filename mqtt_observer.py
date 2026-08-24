@@ -117,6 +117,9 @@ def _handle(device_id: str, wire: str, direction: str) -> None:
             provisioning_state(device_id, counter, 'COMPLETED'); _clear(device_id)
         return
 
+    if wire.startswith('S|') and direction == 'ESP_TO_OTA':
+        return
+
     if wire.startswith('C|') and direction == 'OTA_TO_ESP':
         parts = wire.split('|')
         if len(parts) >= 3:
@@ -157,7 +160,7 @@ def main() -> None:
         if not topic_device or not wire: return
         device_id = _device_id(topic_device)
         if not device_id: return
-        if wire[:2] in ('H|','A|','R|','P|','T|','C|','F|'):
+        if wire[:2] in ('H|','A|','R|','P|','T|','S|','C|','F|'):
             kind = wire[:1]
             try:
                 record_activity('MQTT', f'{direction} {kind}', device_id=device_id,
