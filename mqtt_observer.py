@@ -16,9 +16,11 @@ from device_registry import normalize_device_id
 OPTIONS_PATH = '/data/options.json'
 SUPERVISOR_TOKEN = os.environ.get('SUPERVISOR_TOKEN', '')
 PROVISION_TIMEOUT_SECONDS = 130
+DUPLICATE_WINDOW_SECONDS = 3.0
 COMPACT_ID_RE = re.compile(r'^[0-9a-fA-F]{16}$')
 
 _active: dict[str, dict] = {}
+_recent_wires: dict[tuple[str, str, str], float] = {}
 _lock = threading.Lock()
 
 
@@ -60,6 +62,18 @@ def _payload_from_message(message, base_topic: str) -> tuple[str | None, str | N
         payload = body.get('ota_transport') if isinstance(body, dict) else None
         return parts[1], payload if isinstance(payload, str) else None, 'ESP_TO_OTA'
     return None, None, 'UNKNOWN'
+
+
+def _is_duplicate(device_id: str, wire: str, direction: str) -> bool:
+    now = time.monotonic()
+    key = (device_id, direction, wire)
+    with _lock:
+        previous = _recent_wires.get(key)
+        _recent_wires[key] = now
+        stale = [k for k, seen in _recent_wires.items() if now - seen > 30.0]
+        for stale_key in stale:
+            _recent_wires.pop(stale_key, None)
+    return previous is not None and now - previous <= DUPLICATE_WINDOW_SECONDS
 
 
 def _active_counter(device_id: str) -> int | None:
@@ -161,6 +175,8 @@ def main() -> None:
         device_id = _device_id(topic_device)
         if not device_id: return
         if wire[:2] in ('H|','A|','R|','P|','T|','S|','C|','F|'):
+            if _is_duplicate(device_id, wire, direction):
+                return
             kind = wire[:1]
             try:
                 record_activity('MQTT', f'{direction} {kind}', device_id=device_id,
