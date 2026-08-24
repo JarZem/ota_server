@@ -113,25 +113,38 @@ static esp_err_t base64url_decode_exact(const char *input, size_t input_len,
 static esp_err_t base64url_encode(const uint8_t *input, size_t input_len,
                                   char *out, size_t out_size)
 {
+    if (input == NULL || out == NULL || out_size == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    unsigned char padded[64];
     size_t written = 0;
-    int ret = mbedtls_base64_encode((unsigned char *)out, out_size, &written,
+    int ret = mbedtls_base64_encode(padded, sizeof(padded), &written,
                                     input, input_len);
-    if (ret != 0 || written >= out_size) {
+    if (ret != 0 || written >= sizeof(padded)) {
+        memset(padded, 0, sizeof(padded));
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    while (written > 0 && padded[written - 1] == '=') {
+        --written;
+    }
+    if (written + 1 > out_size) {
+        memset(padded, 0, sizeof(padded));
         return ESP_ERR_INVALID_SIZE;
     }
 
     for (size_t i = 0; i < written; ++i) {
-        if (out[i] == '+') {
-            out[i] = '-';
-        } else if (out[i] == '/') {
-            out[i] = '_';
+        char ch = (char)padded[i];
+        if (ch == '+') {
+            ch = '-';
+        } else if (ch == '/') {
+            ch = '_';
         }
-    }
-
-    while (written > 0 && out[written - 1] == '=') {
-        --written;
+        out[i] = ch;
     }
     out[written] = '\0';
+    memset(padded, 0, sizeof(padded));
     return ESP_OK;
 }
 
