@@ -133,7 +133,7 @@ def render_ingress_tables() -> str:
         events = conn.execute("SELECT * FROM activity_log ORDER BY created_at DESC, id DESC LIMIT 100").fetchall()
         artifacts = conn.execute("SELECT * FROM artifact_publications ORDER BY published_at DESC, id DESC LIMIT 100").fetchall()
         provisioning = conn.execute("SELECT * FROM provisioning_attempts ORDER BY updated_at DESC, id DESC LIMIT 100").fetchall()
-        device_fw = conn.execute("SELECT * FROM device_firmware_status ORDER BY updated_at DESC, id DESC LIMIT 100").fetchall()
+        device_fw = conn.execute("SELECT * FROM device_firmware_status ORDER BY updated_at DESC LIMIT 100").fetchall()
 
     event_rows = ''.join(
         '<tr class="ota-event ota-cat-{cat} ota-sev-{sev}" data-cat="{cat}"><td class="ota-time">{time}</td><td><span class="ota-badge">{cat}</span></td><td>{action}</td><td><code>{dev}</code></td><td>{detail}</td></tr>'.format(
