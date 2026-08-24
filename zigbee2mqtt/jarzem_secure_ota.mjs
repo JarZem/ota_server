@@ -97,7 +97,7 @@ const fromRaw={cluster:OTA_CLUSTER_NAME,type:['raw'],convert:(model,msg,publish,
     const b=Buffer.isBuffer(raw)?raw:Buffer.from(raw);
     if(b.length<2)return;
     const direct=b.toString('utf8');
-    if(/^(H|D|R|F|T)\|/.test(direct))return otaUplinkState(msg,meta,direct);
+    if(/^(H|D|R|F|T|S)\|/.test(direct))return otaUplinkState(msg,meta,direct);
     if(b.length>=4&&b[2]===OTA_CMD_FROM_DEVICE_ID){
         const n=b[3];
         if(n<1||b.length<4+n)return;
