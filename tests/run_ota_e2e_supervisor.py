@@ -115,8 +115,6 @@ def paste_private_key() -> str:
         lines.append(stripped)
         if stripped in PRIVATE_KEY_ENDINGS:
             value = '\n'.join(lines) + '\n'
-            if 'PRIVATE KEY-----' not in value:
-                raise RuntimeError('invalid Root CA private key PEM')
             print('Root CA private key received.')
             return value
 
@@ -179,6 +177,12 @@ def run(slug: str, ca_cert: str, ca_key: str | None,
         password = getpass.getpass('Root CA private key password (empty if unencrypted): ')
 
     bundle = write_bundle(cert, key, password)
+    status_path = bundle.with_suffix('.status.json')
+    try:
+        status_path.unlink()
+    except FileNotFoundError:
+        pass
+
     marker = f'STDIN: starting live OTA E2E test bundle={bundle}'
     print(f"OTA add-on {slug} version={info.get('version')} state={info.get('state')}")
     print(f'Root CA certificate: {ca_cert}')
@@ -192,6 +196,8 @@ def run(slug: str, ca_cert: str, ca_key: str | None,
         deadline = time.monotonic() + TIMEOUT_SECONDS
         while time.monotonic() < deadline:
             text = addon_logs(slug)
+            if len(text) < printed:
+                printed = 0
             if len(text) > printed:
                 chunk = text[printed:]
                 sys.stdout.write(chunk)
@@ -200,24 +206,26 @@ def run(slug: str, ca_cert: str, ca_key: str | None,
                 sys.stdout.flush()
                 printed = len(text)
 
-            tail_start = text.rfind(marker)
-            tail = text[tail_start:] if tail_start >= 0 else ''
-            if 'PASS  live E2E test completed' in tail or 'FINAL RESULT: PASS' in tail:
-                print('\nFINAL RESULT: PASS')
-                return 0
-            if ('FAILED run evidence intentionally retained' in tail or
-                    'Traceback (most recent call last):' in tail or
-                    'AssertionError:' in tail):
-                print('\nFINAL RESULT: FAIL')
-                return 1
+            if status_path.is_file():
+                status = json.loads(status_path.read_text(encoding='utf-8'))
+                state = str(status.get('state') or '')
+                detail = str(status.get('detail') or '')
+                if state == 'PASS':
+                    print('\nFINAL RESULT: PASS')
+                    return 0
+                if state == 'FAIL':
+                    print(f'\nFINAL RESULT: FAIL{": " + detail if detail else ""}')
+                    return 1
             time.sleep(POLL_SECONDS)
-        print('\nFINAL RESULT: TIMEOUT')
+
+        print('\nFINAL RESULT: TIMEOUT waiting for OTA-side completion status')
         return 2
     finally:
-        try:
-            bundle.unlink()
-        except FileNotFoundError:
-            pass
+        for path in (bundle, status_path):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def main() -> int:
