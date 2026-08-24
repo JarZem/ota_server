@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import os
 import re
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
+import activity
 import server
 from activity import firmware_device_state, render_ingress_tables
 from database import assert_schema_current, database_summary, db_connect
@@ -17,6 +21,24 @@ from ota_check_runtime import (
     should_skip_payload,
     validate_dispatch_token,
 )
+
+
+DISPLAY_TIMEZONE = ZoneInfo('Europe/Prague')
+
+
+def _compact_time_prague(ts) -> str:
+    if not ts:
+        return ''
+    value = int(ts)
+    now = datetime.now(DISPLAY_TIMEZONE)
+    event = datetime.fromtimestamp(value, DISPLAY_TIMEZONE)
+    days = max(0, (now.date() - event.date()).days)
+    prefix = 'T' if days == 0 else f'-{days}'
+    return f'{prefix} {event:%H:%M:%S}'
+
+
+# Stored timestamps are Unix UTC seconds. Only presentation is converted to HA local time.
+activity._compact_time = _compact_time_prague
 
 
 def init_mysql_runtime() -> None:
@@ -98,12 +120,7 @@ server.get_zha_devices = get_ota_devices_from_ha
 
 
 def merged_device_records():
-    """Merge HA live metadata with the CA-backed OTA security registry.
-
-    Never infer a registered ESP identity from a firmware BIN. HA supplies
-    model/HW/FW; device_certificates supplies role, certificate fingerprint and
-    authenticated HELLO state.
-    """
+    """Merge HA live metadata with the CA-backed OTA security registry."""
     ha_map = {d["ieee"]: d for d in get_ota_devices_from_ha()}
     cert_map = {d["device_id"]: d for d in list_registered_devices()}
     result = []
@@ -127,7 +144,7 @@ def merged_device_records():
             "hardware_revision": ha.get("hw_version") or cert.get("hardware_revision") or "unknown",
             "chip_family": cert.get("chip_family") or "unknown",
             "flash_size": cert.get("flash_size") or "unknown",
-            "firmware_version": ha.get("sw_version") or "",
+            "firmware_version": cert.get("running_firmware_version") or ha.get("sw_version") or "",
             "firmware_product": ha.get("model_id") or ha.get("model") or cert.get("device_model") or "unknown",
             "firmware_channel": "stable",
             "device_public_key_fingerprint": cert.get("certificate_fingerprint") or "",
@@ -137,6 +154,7 @@ def merged_device_records():
 
 
 server.list_device_records = merged_device_records
+
 
 _original_write_ota_payload_to_zigbee = server.write_ota_payload_to_zigbee
 
@@ -152,6 +170,96 @@ def write_ota_payload_to_zigbee(device, payload):
 
 
 server.write_ota_payload_to_zigbee = write_ota_payload_to_zigbee
+
+
+def _maintenance_button(target: str, label: str, confirm: str) -> str:
+    return (
+        '<form method="post" action="maintenance/clear" class="ota-maint-form" '
+        f'onsubmit="return confirm({server.json.dumps(confirm)})">'
+        f'<input type="hidden" name="target" value="{server.html.escape(target)}">'
+        f'<button type="submit" class="ota-danger">{server.html.escape(label)}</button>'
+        '</form>'
+    )
+
+
+def _clear_test_data(conn) -> int:
+    rows = conn.execute(
+        "SELECT device_id FROM device_certificates WHERE device_group=? OR product_role=? OR device_model=?",
+        ('ota-e2e-live', 'integration-test', 'ESP32-C6-E2E'),
+    ).fetchall()
+    device_ids = [str(row['device_id']) for row in rows]
+    removed = 0
+    for device_id in device_ids:
+        for table in ('device_firmware_status', 'provisioning_attempts', 'device_provisioning', 'download_grants', 'devices'):
+            result = conn.execute(f"DELETE FROM {table} WHERE device_id=?", (device_id,))
+            removed += max(0, int(result.rowcount or 0))
+        result = conn.execute("DELETE FROM activity_log WHERE device_id=?", (device_id,))
+        removed += max(0, int(result.rowcount or 0))
+    result = conn.execute("DELETE FROM device_certificates WHERE device_group=? OR product_role=? OR device_model=?",
+                          ('ota-e2e-live', 'integration-test', 'ESP32-C6-E2E'))
+    removed += max(0, int(result.rowcount or 0))
+
+    # Synthetic E2E firmware always uses ota-e2e-*; normal firmware is untouched.
+    for table, column in (
+        ('device_firmware_status', 'firmware_filename'),
+        ('artifact_publications', 'firmware_filename'),
+        ('firmware_alias', 'filename'),
+        ('firmware_history', 'filename'),
+        ('firmware_images', 'filename'),
+    ):
+        result = conn.execute(f"DELETE FROM {table} WHERE {column} LIKE 'ota-e2e-%'")
+        removed += max(0, int(result.rowcount or 0))
+    conn.execute("DELETE FROM activity_log WHERE detail LIKE '%ota-e2e-%'")
+
+    try:
+        for name in os.listdir(server.FIRMWARE_DIR):
+            if name.startswith('ota-e2e-'):
+                path = os.path.join(server.FIRMWARE_DIR, name)
+                if os.path.isfile(path):
+                    os.remove(path)
+    except OSError as exc:
+        print(f'OTA maintenance: E2E file cleanup warning: {exc}', flush=True)
+    return removed
+
+
+def clear_maintenance_target(target: str) -> str:
+    target = str(target or '').strip().lower()
+    labels = {
+        'activity': 'OTA activity',
+        'artifacts': 'BIN / MJS detail',
+        'provisioning': 'Provisioning detail',
+        'firmware': 'ESP × firmware detail',
+        'esp': 'OTA ESP registry',
+        'images': 'Images metadata',
+        'tests': 'E2E test data',
+    }
+    if target not in labels:
+        raise ValueError('Unknown maintenance target')
+
+    removed = 0
+    with db_connect() as conn:
+        if target == 'activity':
+            removed = max(0, int(conn.execute('DELETE FROM activity_log').rowcount or 0))
+        elif target == 'artifacts':
+            removed = max(0, int(conn.execute('DELETE FROM artifact_publications').rowcount or 0))
+        elif target == 'provisioning':
+            removed = max(0, int(conn.execute('DELETE FROM provisioning_attempts').rowcount or 0))
+        elif target == 'firmware':
+            removed = max(0, int(conn.execute('DELETE FROM device_firmware_status').rowcount or 0))
+        elif target == 'esp':
+            # HA/Zigbee registry is not touched. Only OTA-owned device state is reset.
+            for table in ('device_firmware_status', 'provisioning_attempts', 'device_provisioning', 'download_grants', 'devices', 'device_certificates'):
+                removed += max(0, int(conn.execute(f'DELETE FROM {table}').rowcount or 0))
+        elif target == 'images':
+            # Remove database metadata only; firmware files are deliberately retained.
+            for table in ('device_firmware_status', 'download_grants', 'artifact_publications', 'firmware_alias', 'firmware_history', 'firmware_images'):
+                removed += max(0, int(conn.execute(f'DELETE FROM {table}').rowcount or 0))
+        elif target == 'tests':
+            removed = _clear_test_data(conn)
+
+    print(f'OTA maintenance: cleared target={target} rows={removed}', flush=True)
+    return f'{labels[target]}: odstraněno {removed} záznamů.'
+
 
 _original_page_html = server.page_html
 
@@ -181,6 +289,15 @@ def page_html(message=""):
             'activity': f'<h3>OTA lifecycle</h3><p class="error">Cannot read OTA lifecycle tables: {server.html.escape(str(exc))}</p>'
         }
 
+    lifecycle_panels['activity'] = lifecycle_panels.get('activity', '') + _maintenance_button(
+        'activity', 'Smazat OTA activity', 'Opravdu smazat celý OTA activity log?')
+    lifecycle_panels['artifacts'] = lifecycle_panels.get('artifacts', '') + _maintenance_button(
+        'artifacts', 'Smazat BIN / MJS detail', 'Opravdu smazat historii publikovaných BIN / MJS?')
+    lifecycle_panels['provisioning'] = lifecycle_panels.get('provisioning', '') + _maintenance_button(
+        'provisioning', 'Smazat provisioning detail', 'Opravdu smazat historii provisioning pokusů?')
+    lifecycle_panels['firmware'] = lifecycle_panels.get('firmware', '') + _maintenance_button(
+        'firmware', 'Smazat ESP × firmware detail', 'Opravdu smazat historii ESP × firmware?')
+
     labels = [
         ('images', 'Images'),
         ('esp', 'ESP'),
@@ -193,20 +310,29 @@ def page_html(message=""):
         f'<button type="button" class="ota-main-tab{" active" if key == "images" else ""}" data-main-tab="{key}">{label}</button>'
         for key, label in labels
     ) + '</nav>'
+    nav += '<div class="ota-global-maint">' + _maintenance_button(
+        'tests', 'Smazat E2E testovací data',
+        'Smazat pouze E2E testovací zařízení a ota-e2e-* data? Normální ESP a firmware zůstanou zachovány.') + '</div>'
 
     top_style = f'''<style>
 {lifecycle_style}
-.ota-main-tabs {{display:flex;flex-wrap:wrap;gap:6px;margin:12px 0 18px;border-bottom:1px solid #888;padding-bottom:6px}}
+.ota-main-tabs {{display:flex;flex-wrap:wrap;gap:6px;margin:12px 0 8px;border-bottom:1px solid #888;padding-bottom:6px}}
 .ota-main-tab {{margin:0;padding:7px 12px;border:1px solid #777;border-radius:4px 4px 0 0;background:#222;color:#ddd;cursor:pointer}}
 .ota-main-tab.active {{background:#ddd;color:#111}}
 .ota-main-panel {{display:none}}
 .ota-main-panel.active {{display:block}}
+.ota-maint-form {{display:inline-block;margin:10px 8px 10px 0}}
+.ota-danger {{border:1px solid #c44;background:#3a1717;color:#ffd7d7;border-radius:4px;padding:6px 10px;cursor:pointer}}
+.ota-global-maint {{margin:0 0 14px}}
 </style>'''
 
     body = body.replace('</head>', top_style + '\n</head>', 1)
     body = body.replace('<h2>ESP OTA Server</h2>', '<h2>ESP OTA Server</h2>\n' + nav, 1)
-    body = body.replace('<h3>Firmware biny</h3>', '<section class="ota-main-panel active" data-main-panel="images">\n<h3>Firmware biny</h3>', 1)
-    body = body.replace('<h3>Registrované ESP moduly</h3>', '</section>\n<section class="ota-main-panel" data-main-panel="esp">\n<h3>Registrované ESP moduly</h3>', 1)
+    body = body.replace('<h3>Firmware biny</h3>', '<section class="ota-main-panel active" data-main-panel="images">\n<h3>Firmware biny</h3>' + _maintenance_button(
+        'images', 'Smazat metadata Images', 'Opravdu smazat metadata firmware Images? BIN soubory na disku zůstanou zachovány.'), 1)
+    body = body.replace('<h3>Registrované ESP moduly</h3>', '</section>\n<section class="ota-main-panel" data-main-panel="esp">\n<h3>Registrované ESP moduly</h3>' + _maintenance_button(
+        'esp', 'Resetovat OTA ESP registry',
+        'POZOR: smaže OTA certifikační registry, provisioning a OTA stav zařízení. Home Assistant/Zigbee zařízení se nesmažou. Pokračovat?'), 1)
 
     extra_panels = []
     for key in ('activity', 'artifacts', 'provisioning', 'firmware'):
@@ -233,6 +359,27 @@ document.querySelectorAll('.ota-filter').forEach(button => button.addEventListen
 
 
 server.page_html = page_html
+
+
+class MaintenanceUIHandler(server.UIHandler):
+    def do_POST(self):
+        parsed = server.urllib.parse.urlparse(self.path)
+        if parsed.path.rstrip('/') == '/maintenance/clear':
+            try:
+                length = int(self.headers.get('Content-Length') or 0)
+                if length <= 0 or length > 4096:
+                    raise ValueError('Invalid maintenance request')
+                values = server.urllib.parse.parse_qs(self.rfile.read(length).decode('utf-8'))
+                target = (values.get('target') or [''])[0]
+                message = clear_maintenance_target(target)
+                self.send_html(page_html(message))
+            except Exception as exc:
+                self.send_html(page_html(f'Mazání selhalo: {exc}'), status=400)
+            return
+        return super().do_POST()
+
+
+server.UIHandler = MaintenanceUIHandler
 
 
 class SecureOTAHandler(server.OTAHandler):
