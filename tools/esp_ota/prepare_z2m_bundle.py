@@ -121,6 +121,7 @@ def main() -> None:
     p.add_argument('--project', type=Path, required=True)
     p.add_argument('--submodule', type=Path, required=True)
     p.add_argument('--output', type=Path, required=True)
+    p.add_argument('--version', default='')
     args = p.parse_args()
 
     project = args.project.resolve()
@@ -141,7 +142,7 @@ def main() -> None:
     _validate_project_only(project_part, project_text)
     _validate_ota_module(ota_part, ota_text)
 
-    version = _version(project)
+    version = args.version.strip() or _version(project)
     base_name = project_part.name[:-len('.project.mjs')]
     output.mkdir(parents=True, exist_ok=True)
     for old in output.glob('*.mjs'):
