@@ -50,6 +50,8 @@ def _validate_ota_module(path: Path, text: str) -> None:
         raise SystemExit('OTA module must keep ota_control endpoint mapping for device metadata/interview')
     if ".withCategory('config')" in text or '.withCategory("config")' in text:
         raise SystemExit('OTA module enable_ota must be a normal control, not a disabled/config-category HA entity')
+    if not re.search(r'\^\(H\|D\|R\|F\|T\|S\)\\\|', text):
+        raise SystemExit('OTA module raw uplink parser must pass signed boot STATUS S frames')
 
 
 def _remove_imports(text: str) -> str:
@@ -167,12 +169,15 @@ def main() -> None:
         raise SystemExit('Generated converter does not suppress OTA endpoint suffixes')
     if ".withCategory('config')" in generated or '.withCategory("config")' in generated:
         raise SystemExit('Generated converter enable_ota is incorrectly marked as config-category')
+    if not re.search(r'\^\(H\|D\|R\|F\|T\|S\)\\\|', generated):
+        raise SystemExit('Generated converter does not pass signed boot STATUS S frames')
 
     print(f'Zigbee2MQTT converter ready: {target}')
     print(f'  firmware build: {version}')
     print('  single-file deployment: yes')
     print('  project/OTA lexical scope isolation: yes')
     print('  OTA HA enable_ota: endpoint 11 internal, STATE+SET+GET, unsuffixed')
+    print('  signed boot STATUS S uplink: yes')
 
 
 if __name__ == '__main__':
