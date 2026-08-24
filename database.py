@@ -14,7 +14,7 @@ from sqlalchemy.engine import Engine
 OPTIONS_PATH = Path('/data/options.json')
 SECRETS_PATH = Path('/share/ota_server/secrets.json')
 ALEMBIC_VERSION_TABLE = 'ota_server_alembic_version'
-EXPECTED_SCHEMA_REVISION = '0004_activity_log'
+EXPECTED_SCHEMA_REVISION = '0005_device_boot_status'
 
 TABLE_MAP = {
     'firmware_images': 'ota_server_firmware_images',
