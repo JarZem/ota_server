@@ -1,5 +1,5 @@
 name: "OTA Server"
-version: "0.1.41"
+version: "0.1.42"
 slug: "ota_server"
 description: "OTA server"
 
@@ -24,7 +24,6 @@ services:
   - mqtt:need
 
 stdin: true
-
 ingress: true
 ingress_port: 8099
 
