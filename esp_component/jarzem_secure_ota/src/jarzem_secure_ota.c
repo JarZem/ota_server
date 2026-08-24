@@ -7,6 +7,7 @@
 #include "esp_log.h"
 #include "esp_zigbee_cluster.h"
 #include "ha/esp_zigbee_ha_standard.h"
+#include "ota_boot_status.h"
 #include "ota_service.h"
 #include "zigbee_ota_cluster.h"
 #include "zigbee_ota_control.h"
@@ -135,7 +136,9 @@ esp_err_t jarzem_ota_device_register(esp_zb_ep_list_t *application_endpoints)
     ESP_RETURN_ON_ERROR(add_ota_endpoints(application_endpoints), TAG,
                         "could not add OTA endpoints");
     ESP_LOGI(TAG, "registering application + OTA endpoints with ESP-Zigbee");
-    return esp_zb_device_register(application_endpoints);
+    esp_err_t err = esp_zb_device_register(application_endpoints);
+    if (err == ESP_OK) ota_boot_status_schedule();
+    return err;
 }
 
 void jarzem_ota_action_handler_register(jarzem_ota_project_action_handler_t project_handler)
