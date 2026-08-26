@@ -205,17 +205,4 @@ def render_ingress_tables() -> str:
 <h3>ESP × firmware detail — posledních 100</h3>
 <div class="table-wrap"><table><thead><tr><th>Time</th><th>ESP</th><th>Build</th><th>BIN</th><th>SHA</th><th>State</th><th>Error</th></tr></thead><tbody>{firmware_rows}</tbody></table></div>
 </section>
-
-<script>
-document.querySelectorAll('.ota-tab').forEach(b=>b.addEventListener('click',()=>{{
-    const tab=b.dataset.tab;
-    document.querySelectorAll('.ota-tab').forEach(x=>x.classList.toggle('active',x===b));
-    document.querySelectorAll('.ota-tab-panel').forEach(p=>p.classList.toggle('active',p.dataset.panel===tab));
-}}));
-document.querySelectorAll('.ota-filter').forEach(b=>b.addEventListener('click',()=>{{
-    const f=b.dataset.filter;
-    document.querySelectorAll('.ota-filter').forEach(x=>x.classList.toggle('active',x===b));
-    document.querySelectorAll('.ota-event').forEach(r=>r.style.display=(f==='ALL'||r.dataset.cat===f)?'':'none');
-}}));
-</script>
 '''
