@@ -7,10 +7,10 @@
 #include "esp_zigbee_core.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "jarzem_secure_ota.h"
 #include "ota_check_auth.h"
 #include "ota_secure_session.h"
 #include "ota_service.h"
-#include "status_led.h"
 #include "zigbee_ota_cluster.h"
 
 static const char *TAG = "zigbee_ota_control";
@@ -69,9 +69,6 @@ void zigbee_ota_control_set_status(zigbee_ota_status_t status)
     s_status = (uint8_t)status;
     set_manufacturer_attr_locked(ZIGBEE_OTA_STATUS_CLUSTER_ID, ZIGBEE_OTA_STATUS_ATTR_ID, &s_status);
 
-    /* Provisioning is one explicit attempt. A terminal state closes Enable OTA
-       before the state uplink is emitted, therefore no second T frame is needed
-       and the HELLO task cannot start another two-minute retry cycle. */
     if (provisioning_terminal(status) && s_enable_ota) {
         s_enable_ota = false;
         set_manufacturer_attr_locked(ZIGBEE_OTA_ENABLE_CLUSTER_ID, ZIGBEE_OTA_ENABLE_ATTR_ID, &s_enable_ota);
@@ -205,7 +202,7 @@ esp_err_t zigbee_ota_control_add_endpoint(esp_zb_ep_list_t *ep_list)
 bool zigbee_ota_control_handle_set_attr(const esp_zb_zcl_set_attr_value_message_t *message)
 {
     if (message == NULL || message->info.status != ESP_ZB_ZCL_STATUS_SUCCESS || message->info.dst_endpoint != ZIGBEE_OTA_CONTROL_ENDPOINT || message->info.cluster != ZIGBEE_OTA_ENABLE_CLUSTER_ID || message->attribute.id != ZIGBEE_OTA_ENABLE_ATTR_ID) return false;
-    status_led_indicate_ha_command();
+    jarzem_ota_hook_rx_from_ha();
     if (message->attribute.data.type != ESP_ZB_ZCL_ATTR_TYPE_BOOL || message->attribute.data.value == NULL) { ESP_LOGW(TAG, "Enable OTA rejected: invalid type/value"); return true; }
     s_enable_ota = *(bool *)message->attribute.data.value;
     ESP_LOGI(TAG, "Enable OTA write received=%u", s_enable_ota ? 1U : 0U);
