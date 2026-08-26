@@ -1,5 +1,5 @@
 name: "OTA Server"
-version: "0.1.49"
+version: "0.1.50"
 slug: "ota_server"
 description: "OTA server"
 
@@ -16,6 +16,8 @@ ports:
 map:
   - type: share
     read_only: false
+  - type: addons
+    read_only: true
 
 homeassistant_api: true
 hassio_api: true
