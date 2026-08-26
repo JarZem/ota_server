@@ -128,6 +128,11 @@ def _e(value) -> str:
     return html.escape(str(value or ''))
 
 
+def _display_category(value) -> str:
+    category = str(value or 'OTHER').upper()
+    return 'CERT' if category == 'REG' else category
+
+
 def render_ingress_tables() -> str:
     with db_connect() as conn:
         events = conn.execute("SELECT * FROM activity_log ORDER BY created_at DESC, id DESC LIMIT 100").fetchall()
@@ -137,7 +142,7 @@ def render_ingress_tables() -> str:
 
     event_rows = ''.join(
         '<tr class="ota-event ota-cat-{cat} ota-sev-{sev}" data-cat="{cat}"><td class="ota-time">{time}</td><td><span class="ota-badge">{cat}</span></td><td>{action}</td><td><code>{dev}</code></td><td>{detail}</td></tr>'.format(
-            cat=_e(str(r['category']).upper()), sev=_e(str(r['severity']).lower()), time=_e(_compact_time(r['created_at'])),
+            cat=_e(_display_category(r['category'])), sev=_e(str(r['severity']).lower()), time=_e(_compact_time(r['created_at'])),
             action=_e(r['action']), dev=_e(r['device_id']), detail=_e(r['detail'])) for r in events
     ) or '<tr><td colspan="5">No activity yet.</td></tr>'
 
@@ -164,7 +169,7 @@ def render_ingress_tables() -> str:
 .ota-log td{{padding:3px 6px;vertical-align:top}}
 .ota-time{{white-space:nowrap;font-family:monospace}}
 .ota-badge{{font-weight:700}}
-.ota-cat-REG .ota-badge{{color:#6cf}}
+.ota-cat-CERT .ota-badge{{color:#6cf}}
 .ota-cat-BIN .ota-badge{{color:#7ee787}}
 .ota-cat-MJS .ota-badge{{color:#d2a8ff}}
 .ota-cat-PROV .ota-badge{{color:#ffa657}}
@@ -183,7 +188,7 @@ def render_ingress_tables() -> str:
 <section class="ota-tab-panel active" data-panel="activity">
 <h3>OTA activity — posledních 100</h3>
 <div class="ota-log-toolbar">
-<button type="button" class="ota-filter active" data-filter="ALL">ALL</button><button type="button" class="ota-filter" data-filter="REG">REG</button>
+<button type="button" class="ota-filter active" data-filter="ALL">ALL</button><button type="button" class="ota-filter" data-filter="CERT">CERT</button>
 <button type="button" class="ota-filter" data-filter="BIN">BIN</button><button type="button" class="ota-filter" data-filter="MJS">MJS</button>
 <button type="button" class="ota-filter" data-filter="PROV">PROV</button><button type="button" class="ota-filter" data-filter="CHECK">CHECK</button>
 <button type="button" class="ota-filter" data-filter="DOWNLOAD">DOWNLOAD</button><button type="button" class="ota-filter" data-filter="MQTT">MQTT</button>
