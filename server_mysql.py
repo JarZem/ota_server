@@ -37,7 +37,6 @@ def _compact_time_prague(ts) -> str:
     return f'{prefix} {event:%H:%M:%S}'
 
 
-# Stored timestamps are Unix UTC seconds. Only presentation is converted to HA local time.
 activity._compact_time = _compact_time_prague
 
 
@@ -149,38 +148,82 @@ server.write_ota_payload_to_zigbee = write_ota_payload_to_zigbee
 
 def _maintenance_button(target: str, label: str, confirm: str) -> str:
     return (
-        '<form method="post" action="maintenance/clear" class="ota-maint-form" '
+        '<form method="post" action="" class="ota-maint-form" '
         f"onsubmit='return confirm({server.json.dumps(confirm)})'>"
+        '<input type="hidden" name="maintenance_action" value="clear">'
         f'<input type="hidden" name="target" value="{server.html.escape(target)}">'
         f'<button type="submit" class="ota-danger">{server.html.escape(label)}</button>'
         '</form>'
     )
 
 
+def _rowcount(result) -> int:
+    return max(0, int(result.rowcount or 0))
+
+
+def _delete_for_ids(conn, table: str, column: str, device_ids: list[str]) -> int:
+    if not device_ids:
+        return 0
+    placeholders = ','.join('?' for _ in device_ids)
+    return _rowcount(conn.execute(
+        f'DELETE FROM {table} WHERE {column} IN ({placeholders})', tuple(device_ids)))
+
+
 def _clear_test_data(conn) -> int:
-    rows = conn.execute("SELECT device_id FROM device_certificates WHERE device_group=? OR product_role=? OR device_model=?",
-                        ('ota-e2e-live', 'integration-test', 'ESP32-C6-E2E')).fetchall()
-    device_ids = [str(row['device_id']) for row in rows]
+    rows = conn.execute(
+        "SELECT device_id FROM device_certificates "
+        "WHERE device_group=? OR product_role=? OR device_model=?",
+        ('ota-e2e-live', 'integration-test', 'ESP32-C6-E2E')
+    ).fetchall()
+    device_ids = sorted({str(row['device_id']) for row in rows})
     removed = 0
-    for device_id in device_ids:
-        for table in ('device_firmware_status', 'provisioning_attempts', 'device_provisioning', 'download_grants', 'devices'):
-            result = conn.execute(f"DELETE FROM {table} WHERE device_id=?", (device_id,))
-            removed += max(0, int(result.rowcount or 0))
-        result = conn.execute("DELETE FROM activity_log WHERE device_id=?", (device_id,))
-        removed += max(0, int(result.rowcount or 0))
-    result = conn.execute("DELETE FROM device_certificates WHERE device_group=? OR product_role=? OR device_model=?",
-                          ('ota-e2e-live', 'integration-test', 'ESP32-C6-E2E'))
-    removed += max(0, int(result.rowcount or 0))
+
+    # Every OTA table which can contain an E2E device or ota-e2e-* artifact is
+    # cleaned here. Keep child/history tables first and identity/artifact roots last.
     for table, column in (
-        ('device_firmware_status', 'firmware_filename'),
-        ('artifact_publications', 'firmware_filename'),
-        ('firmware_alias', 'filename'),
-        ('firmware_history', 'filename'),
-        ('firmware_images', 'filename'),
+        ('device_firmware_status', 'device_id'),
+        ('provisioning_attempts', 'device_id'),
+        ('device_provisioning', 'device_id'),
+        ('download_grants', 'device_id'),
+        ('ota_dispatch', 'ieee'),
+        ('artifact_publications', 'publisher_device_id'),
+        ('activity_log', 'device_id'),
+        ('devices', 'device_id'),
     ):
-        result = conn.execute(f"DELETE FROM {table} WHERE {column} LIKE 'ota-e2e-%'")
-        removed += max(0, int(result.rowcount or 0))
-    conn.execute("DELETE FROM activity_log WHERE detail LIKE '%ota-e2e-%'")
+        removed += _delete_for_ids(conn, table, column, device_ids)
+
+    # The legacy devices table can also carry the same identity in zigbee_ieee.
+    removed += _delete_for_ids(conn, 'devices', 'zigbee_ieee', device_ids)
+
+    # Firmware-related test rows are identifiable even after a previous partial
+    # cleanup removed the test certificate/device registry.
+    for sql in (
+        "DELETE FROM device_firmware_status WHERE firmware_filename LIKE 'ota-e2e-%'",
+        "DELETE FROM device_provisioning WHERE firmware_filename LIKE 'ota-e2e-%'",
+        "DELETE FROM ota_dispatch WHERE filename LIKE 'ota-e2e-%'",
+        "DELETE FROM artifact_publications WHERE firmware_filename LIKE 'ota-e2e-%' OR converter_project LIKE 'ota-e2e-%' OR converter_filename LIKE 'ota-e2e-%'",
+        "DELETE FROM firmware_alias WHERE filename LIKE 'ota-e2e-%'",
+        "DELETE FROM firmware_history WHERE filename LIKE 'ota-e2e-%'",
+        "DELETE FROM firmware_images WHERE filename LIKE 'ota-e2e-%'",
+        "DELETE FROM activity_log WHERE detail LIKE '%ota-e2e-%'",
+        "DELETE FROM command_counters WHERE scope LIKE '%ota-e2e-%'",
+    ):
+        removed += _rowcount(conn.execute(sql))
+
+    # A counter scope may contain the normalized virtual device id rather than
+    # the project name. Remove only scopes containing one of our E2E identities.
+    for device_id in device_ids:
+        removed += _rowcount(conn.execute(
+            "DELETE FROM command_counters WHERE scope LIKE ?",
+            (f'%{device_id}%',)
+        ))
+
+    removed += _rowcount(conn.execute(
+        "DELETE FROM device_certificates "
+        "WHERE device_group=? OR product_role=? OR device_model=?",
+        ('ota-e2e-live', 'integration-test', 'ESP32-C6-E2E')
+    ))
+
     try:
         for name in os.listdir(server.FIRMWARE_DIR):
             if name.startswith('ota-e2e-'):
@@ -204,19 +247,28 @@ def clear_maintenance_target(target: str) -> str:
     removed = 0
     with db_connect() as conn:
         if target == 'activity':
-            removed = max(0, int(conn.execute('DELETE FROM activity_log').rowcount or 0))
+            removed = _rowcount(conn.execute('DELETE FROM activity_log'))
         elif target == 'artifacts':
-            removed = max(0, int(conn.execute('DELETE FROM artifact_publications').rowcount or 0))
+            removed = _rowcount(conn.execute('DELETE FROM artifact_publications'))
         elif target == 'provisioning':
-            removed = max(0, int(conn.execute('DELETE FROM provisioning_attempts').rowcount or 0))
+            removed = _rowcount(conn.execute('DELETE FROM provisioning_attempts'))
         elif target == 'firmware':
-            removed = max(0, int(conn.execute('DELETE FROM device_firmware_status').rowcount or 0))
+            removed = _rowcount(conn.execute('DELETE FROM device_firmware_status'))
         elif target == 'esp':
-            for table in ('device_firmware_status', 'provisioning_attempts', 'device_provisioning', 'download_grants', 'devices', 'device_certificates'):
-                removed += max(0, int(conn.execute(f'DELETE FROM {table}').rowcount or 0))
+            # Reset only ESP/device-side OTA state; HA/Z2M device registry is untouched.
+            for table in (
+                'device_firmware_status', 'provisioning_attempts', 'device_provisioning',
+                'download_grants', 'ota_dispatch', 'devices', 'device_certificates',
+            ):
+                removed += _rowcount(conn.execute(f'DELETE FROM {table}'))
+            removed += _rowcount(conn.execute(
+                "DELETE FROM activity_log WHERE device_id IS NOT NULL AND device_id <> ''"))
         elif target == 'images':
-            for table in ('device_firmware_status', 'download_grants', 'artifact_publications', 'firmware_alias', 'firmware_history', 'firmware_images'):
-                removed += max(0, int(conn.execute(f'DELETE FROM {table}').rowcount or 0))
+            for table in (
+                'device_firmware_status', 'download_grants', 'artifact_publications',
+                'ota_dispatch', 'firmware_alias', 'firmware_history', 'firmware_images',
+            ):
+                removed += _rowcount(conn.execute(f'DELETE FROM {table}'))
         elif target == 'tests':
             removed = _clear_test_data(conn)
     print(f'OTA maintenance: cleared target={target} rows={removed}', flush=True)
@@ -234,7 +286,16 @@ def _lifecycle_parts(section: str):
     return style, panels
 
 
-def page_html(message=""):
+def _tab_message(target: str, message: str, error: bool = False) -> str:
+    if not message:
+        return ''
+    cls = 'ota-tab-message error' if error else 'ota-tab-message'
+    return f'<div class="{cls}">{server.html.escape(message)}</div>'
+
+
+def page_html(message="", maintenance_target="", maintenance_message="", maintenance_error=False):
+    # Ordinary OTA/send messages retain the original behavior. Maintenance
+    # messages are deliberately kept out of the global message area.
     body = _original_page_html(message)
     try:
         lifecycle = render_ingress_tables()
@@ -243,18 +304,38 @@ def page_html(message=""):
         lifecycle_style = ''
         lifecycle_panels = {'activity': f'<h3>OTA lifecycle</h3><p class="error">Cannot read OTA lifecycle tables: {server.html.escape(str(exc))}</p>'}
 
-    lifecycle_panels['activity'] = lifecycle_panels.get('activity', '') + _maintenance_button('activity', 'Smazat OTA activity', 'Opravdu smazat celý OTA activity log?')
-    lifecycle_panels['artifacts'] = lifecycle_panels.get('artifacts', '') + _maintenance_button('artifacts', 'Smazat BIN / MJS detail', 'Opravdu smazat historii publikovaných BIN / MJS?')
-    lifecycle_panels['provisioning'] = lifecycle_panels.get('provisioning', '') + _maintenance_button('provisioning', 'Smazat provisioning detail', 'Opravdu smazat historii provisioning pokusů?')
-    lifecycle_panels['firmware'] = lifecycle_panels.get('firmware', '') + _maintenance_button('firmware', 'Smazat ESP × firmware detail', 'Opravdu smazat historii ESP × firmware?')
+    panel_messages = {key: '' for key in ('images', 'esp', 'activity', 'artifacts', 'provisioning', 'firmware')}
+    if maintenance_target == 'tests':
+        # E2E cleanup is intentionally on the first Images page.
+        panel_messages['images'] = _tab_message('images', maintenance_message, maintenance_error)
+    elif maintenance_target in panel_messages:
+        panel_messages[maintenance_target] = _tab_message(maintenance_target, maintenance_message, maintenance_error)
+
+    # Maintenance controls belong at the TOP of their own tab, never below tables.
+    lifecycle_panels['activity'] = (
+        '<div class="ota-tab-tools">' + _maintenance_button('activity', 'Smazat OTA activity', 'Opravdu smazat celý OTA activity log?') + '</div>' +
+        panel_messages['activity'] + lifecycle_panels.get('activity', '')
+    )
+    lifecycle_panels['artifacts'] = (
+        '<div class="ota-tab-tools">' + _maintenance_button('artifacts', 'Smazat BIN / MJS detail', 'Opravdu smazat historii publikovaných BIN / MJS?') + '</div>' +
+        panel_messages['artifacts'] + lifecycle_panels.get('artifacts', '')
+    )
+    lifecycle_panels['provisioning'] = (
+        '<div class="ota-tab-tools">' + _maintenance_button('provisioning', 'Smazat provisioning detail', 'Opravdu smazat historii provisioning pokusů?') + '</div>' +
+        panel_messages['provisioning'] + lifecycle_panels.get('provisioning', '')
+    )
+    lifecycle_panels['firmware'] = (
+        '<div class="ota-tab-tools">' + _maintenance_button('firmware', 'Smazat ESP × firmware detail', 'Opravdu smazat historii ESP × firmware?') + '</div>' +
+        panel_messages['firmware'] + lifecycle_panels.get('firmware', '')
+    )
 
     labels = [('images', 'Images'), ('esp', 'ESP'), ('activity', 'OTA activity'), ('artifacts', 'BIN / MJS'), ('provisioning', 'Provisioning'), ('firmware', 'ESP × firmware')]
+    active_tab = 'images' if maintenance_target in ('', 'tests', 'images') else maintenance_target
+    if active_tab not in {key for key, _ in labels}:
+        active_tab = 'images'
     nav = '<nav class="ota-main-tabs">' + ''.join(
-        f'<button type="button" class="ota-main-tab{" active" if key == "images" else ""}" data-main-tab="{key}">{label}</button>'
+        f'<button type="button" class="ota-main-tab{" active" if key == active_tab else ""}" data-main-tab="{key}">{label}</button>'
         for key, label in labels) + '</nav>'
-    nav += '<div class="ota-global-maint">' + _maintenance_button(
-        'tests', 'Smazat E2E testovací data',
-        'Smazat pouze E2E testovací zařízení a ota-e2e-* data? Normální ESP a firmware zůstanou zachovány.') + '</div>'
 
     top_style = f'''<style>
 {lifecycle_style}
@@ -263,21 +344,40 @@ def page_html(message=""):
 .ota-main-tab.active {{background:#ddd;color:#111}}
 .ota-main-panel {{display:none}}
 .ota-main-panel.active {{display:block}}
-.ota-maint-form {{display:inline-block;margin:10px 8px 10px 0}}
-.ota-danger {{border:1px solid #c44;background:#3a1717;color:#ffd7d7;border-radius:4px;padding:6px 10px;cursor:pointer}}
-.ota-global-maint {{margin:0 0 14px}}
+.ota-maint-form {{display:inline-block;margin:0 8px 0 0}}
+.ota-tab-tools {{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0 10px}}
+.ota-danger {{margin:0;border:1px solid #c44;background:#3a1717;color:#ffd7d7;border-radius:4px;padding:6px 10px;cursor:pointer}}
+.ota-tab-message {{margin:8px 0 12px;padding:9px 10px;border:1px solid #777}}
+.ota-tab-message.error {{border-color:#b00020;color:#b00020}}
 </style>'''
     body = body.replace('</head>', top_style + '\n</head>', 1)
     body = body.replace('<h2>ESP OTA Server</h2>', '<h2>ESP OTA Server</h2>\n' + nav, 1)
-    body = body.replace('<h3>Firmware biny</h3>', '<section class="ota-main-panel active" data-main-panel="images">\n<h3>Firmware biny</h3>' + _maintenance_button(
-        'images', 'Smazat metadata Images', 'Opravdu smazat metadata firmware Images? BIN soubory na disku zůstanou zachovány.'), 1)
-    body = body.replace('<h3>Registrované ESP moduly</h3>', '</section>\n<section class="ota-main-panel" data-main-panel="esp">\n<h3>Registrované ESP moduly</h3>' + _maintenance_button(
-        'esp', 'Resetovat OTA ESP registry', 'POZOR: smaže OTA certifikační registry, provisioning a OTA stav zařízení. Home Assistant/Zigbee zařízení se nesmažou. Pokračovat?'), 1)
+
+    images_tools = '<div class="ota-tab-tools">' + ''.join((
+        _maintenance_button('images', 'Smazat metadata Images', 'Opravdu smazat metadata firmware Images? BIN soubory na disku zůstanou zachovány.'),
+        _maintenance_button('tests', 'Smazat E2E testovací data', 'Smazat E2E testovací zařízení a všechna ota-e2e-* data ze všech OTA tabulek? Normální ESP a firmware zůstanou zachovány.'),
+    )) + '</div>' + panel_messages['images']
+    esp_tools = '<div class="ota-tab-tools">' + _maintenance_button(
+        'esp', 'Resetovat OTA ESP registry', 'POZOR: smaže OTA certifikační registry, provisioning a OTA stav zařízení. Home Assistant/Zigbee zařízení se nesmažou. Pokračovat?') + '</div>' + panel_messages['esp']
+
+    body = body.replace(
+        '<h3>Firmware biny</h3>',
+        f'<section class="ota-main-panel{" active" if active_tab == "images" else ""}" data-main-panel="images">\n<h3>Firmware biny</h3>' + images_tools,
+        1
+    )
+    body = body.replace(
+        '<h3>Registrované ESP moduly</h3>',
+        f'</section>\n<section class="ota-main-panel{" active" if active_tab == "esp" else ""}" data-main-panel="esp">\n<h3>Registrované ESP moduly</h3>' + esp_tools,
+        1
+    )
+
     extra_panels = []
     for key in ('activity', 'artifacts', 'provisioning', 'firmware'):
         content = lifecycle_panels.get(key)
         if content:
-            extra_panels.append(f'<section class="ota-main-panel" data-main-panel="{key}">{content}</section>')
+            active = ' active' if active_tab == key else ''
+            extra_panels.append(f'<section class="ota-main-panel{active}" data-main-panel="{key}">{content}</section>')
+
     script = '''
 <script>
 document.querySelectorAll('.ota-main-tab').forEach(button => button.addEventListener('click', () => {
@@ -302,18 +402,47 @@ server.page_html = page_html
 class MaintenanceUIHandler(server.UIHandler):
     def do_POST(self):
         parsed = server.urllib.parse.urlparse(self.path)
+
+        # Maintenance uses the CURRENT ingress page as action target. This avoids
+        # HA ingress path-prefix problems and eliminates the old /maintenance/clear 404.
+        if parsed.path.rstrip('/') in ('', '/index.html') or parsed.path == '/':
+            try:
+                length = int(self.headers.get('Content-Length') or 0)
+            except ValueError:
+                length = 0
+            if 0 < length <= 4096:
+                raw = self.rfile.read(length).decode('utf-8')
+                values = server.urllib.parse.parse_qs(raw, keep_blank_values=True)
+                if (values.get('maintenance_action') or [''])[0] == 'clear':
+                    target = (values.get('target') or [''])[0]
+                    try:
+                        message = clear_maintenance_target(target)
+                        self.send_html(page_html('', target, message, False))
+                    except Exception as exc:
+                        self.send_html(page_html('', target, f'Mazání selhalo: {exc}', True), status=400)
+                    return
+                # Not maintenance: delegate with the consumed body impossible.
+                # The ordinary OTA form posts to /send, so root POST is reserved
+                # exclusively for maintenance forms.
+                self.send_error(400, 'Unknown root form action')
+                return
+
+        # Backward compatibility for an already-open old page: accept the old
+        # path too, but new HTML never emits it.
         if parsed.path.rstrip('/') == '/maintenance/clear':
             try:
                 length = int(self.headers.get('Content-Length') or 0)
                 if length <= 0 or length > 4096:
                     raise ValueError('Invalid maintenance request')
-                values = server.urllib.parse.parse_qs(self.rfile.read(length).decode('utf-8'))
+                values = server.urllib.parse.parse_qs(self.rfile.read(length).decode('utf-8'), keep_blank_values=True)
                 target = (values.get('target') or [''])[0]
                 message = clear_maintenance_target(target)
-                self.send_html(page_html(message))
+                self.send_html(page_html('', target, message, False))
             except Exception as exc:
-                self.send_html(page_html(f'Mazání selhalo: {exc}'), status=400)
+                target = locals().get('target', 'images')
+                self.send_html(page_html('', target, f'Mazání selhalo: {exc}', True), status=400)
             return
+
         return super().do_POST()
 
 
