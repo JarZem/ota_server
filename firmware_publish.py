@@ -13,7 +13,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 
 from activity import record_firmware_publish
-from device_registry import verify_and_extract_device_certificate
+from device_registry import register_device_certificate, verify_and_extract_device_certificate
 
 FIRMWARE_DIR = Path('/share/ota_server/firmware')
 MAX_FIRMWARE_BYTES = 16 * 1024 * 1024
@@ -38,21 +38,19 @@ def _send_json(handler, status: int, payload: dict) -> None:
     handler.close_connection = True
 
 
-def _validated_publisher(encoded_cert: str) -> tuple[x509.Certificate, dict]:
-    """Validate publisher identity cryptographically, without runtime registration.
+def _validated_publisher(encoded_cert: str) -> tuple[x509.Certificate, dict, bytes]:
+    """Validate supplied publisher certificate against the configured Root CA.
 
-    verify_and_extract_device_certificate() verifies the supplied public certificate
-    against the OTA server trust anchor and validates its signed identity metadata.
-    Firmware publishing must therefore not depend on device_certificates being
-    populated: resetting runtime ESP state must never invalidate an otherwise valid
-    CA-signed publisher certificate.
+    Publishing itself never depends on prior runtime registration.  The exact same
+    already-validated public certificate can however safely repopulate the device
+    registry afterwards, so a runtime-state reset cannot strand provisioning.
     """
     certificate_pem = _b64url_decode(encoded_cert)
     extracted = verify_and_extract_device_certificate(certificate_pem)
     cert = x509.load_pem_x509_certificate(certificate_pem)
     if not isinstance(cert.public_key(), ec.EllipticCurvePublicKey):
         raise ValueError('publisher_key_not_ec')
-    return cert, extracted
+    return cert, extracted, certificate_pem
 
 
 def _validate_metadata(metadata: dict, sha256_hex: str, size: int,
@@ -96,13 +94,6 @@ def _validate_metadata(metadata: dict, sha256_hex: str, size: int,
 
 
 def _receive_firmware_body(handler, length: int) -> tuple[str, str]:
-    """Consume the complete accepted-size POST body before validating headers.
-
-    This is deliberate: closing the HTTPS socket while the Windows client is still
-    uploading a ~MB firmware body hides the useful HTTP 400 response behind
-    WinError 10053/connection reset. Once the body is consumed, any certificate,
-    metadata or signature error can be returned to the build as normal JSON.
-    """
     FIRMWARE_DIR.mkdir(parents=True, exist_ok=True)
     fd, temp_name = tempfile.mkstemp(prefix='.publish-', suffix='.bin', dir=FIRMWARE_DIR)
     digest = hashlib.sha256()
@@ -154,7 +145,7 @@ def handle_publish(handler) -> None:
 
         metadata_raw = _b64url_decode(metadata_b64)
         metadata = json.loads(metadata_raw.decode('utf-8'))
-        cert, publisher = _validated_publisher(certificate_b64)
+        cert, publisher, certificate_pem = _validated_publisher(certificate_b64)
         signature = _b64url_decode(signature_b64)
         canonical = (
             PUBLISH_DOMAIN
@@ -164,6 +155,11 @@ def handle_publish(handler) -> None:
         )
         cert.public_key().verify(signature, canonical, ec.ECDSA(hashes.SHA256()))
         release = _validate_metadata(metadata, expected_sha, length, publisher)
+
+        # Re-populate the public device certificate registry only after the request
+        # signature and all certificate-bound metadata are valid.  No private key is
+        # transferred and firmware publishing still does not require registration.
+        registration = register_device_certificate(certificate_pem)
 
         target = FIRMWARE_DIR / filename
         release_path = FIRMWARE_DIR / (target.stem + '.release.json')
@@ -180,11 +176,12 @@ def handle_publish(handler) -> None:
         )
         print(
             f"Firmware publish accepted device_id={publisher['device_id']} filename={filename} "
-            f"bytes={length} sha256={expected_sha[:12]}", flush=True,
+            f"bytes={length} sha256={expected_sha[:12]} registry={registration['registration_action']}", flush=True,
         )
         _send_json(handler, 201, {
             'status': 'PUBLISHED', 'publisher_device_id': publisher['device_id'],
             'filename': filename, 'sha256': expected_sha, 'size': length,
+            'device_certificate_registry': registration['registration_action'],
         })
     except Exception as exc:
         if temp_name:
