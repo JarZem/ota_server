@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-RUNTIME_DIR="${OTA_RUNTIME_DIR:-/share/ota_server/runtime}"
+RUNTIME_DIR="${OTA_RUNTIME_DIR:-/addons/ota_server}"
 export OTA_RUNTIME_DIR="$RUNTIME_DIR"
 export PYTHONPATH="$RUNTIME_DIR${PYTHONPATH:+:$PYTHONPATH}"
 cd "$RUNTIME_DIR"
@@ -10,9 +10,6 @@ mkdir -p /share/ota_server/firmware
 
 echo "Starting OTA Server"
 echo "Runtime scripts: $RUNTIME_DIR"
-
-ls -la /share/ota_server/cert
-ls -la /share/ota_server/firmware
 
 echo "esptool:"
 esptool version
@@ -63,8 +60,6 @@ echo "MQTT activity observer running pid=$OBSERVER_PID"
 python3 "$RUNTIME_DIR/server_mysql.py" &
 SERVER_PID=$!
 
-# Supervisor writes command lines to PID 1 stdin. E2E test input is never read
-# from this same stream; it is supplied through a short-lived /share bundle.
 while kill -0 "$SERVER_PID" 2>/dev/null; do
     command=""
     if IFS= read -r -t 1 command; then
