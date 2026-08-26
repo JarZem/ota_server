@@ -22,6 +22,7 @@ COMPACT_ID_RE = re.compile(r'^[0-9a-fA-F]{16}$')
 _active: dict[str, dict] = {}
 _recent_wires: dict[tuple[str, str, str], float] = {}
 _seen_hello: dict[tuple[str, int], float] = {}
+_seen_status: dict[tuple[str, int], float] = {}
 _lock = threading.Lock()
 
 
@@ -85,6 +86,26 @@ def _hello_already_seen(device_id: str, counter: int) -> bool:
         stale = [k for k, seen in _seen_hello.items() if now - seen > 86400.0]
         for stale_key in stale:
             _seen_hello.pop(stale_key, None)
+    return False
+
+
+def _status_already_seen(device_id: str, wire: str) -> bool:
+    parts = wire.split('|', 3)
+    if len(parts) != 4 or parts[0] != 'S':
+        return False
+    try:
+        counter = int(parts[1], 10)
+    except ValueError:
+        return False
+    key = (device_id, counter)
+    now = time.monotonic()
+    with _lock:
+        if key in _seen_status:
+            return True
+        _seen_status[key] = now
+        stale = [k for k, seen in _seen_status.items() if now - seen > 86400.0]
+        for stale_key in stale:
+            _seen_status.pop(stale_key, None)
     return False
 
 
@@ -189,6 +210,8 @@ def main() -> None:
         device_id = _device_id(topic_device)
         if not device_id: return
         if wire[:2] in ('H|','A|','R|','P|','T|','S|','C|','F|'):
+            if wire.startswith('S|') and direction == 'ESP_TO_OTA' and _status_already_seen(device_id, wire):
+                return
             if _is_duplicate(device_id, wire, direction):
                 return
             if wire.startswith('H|') and direction == 'ESP_TO_OTA':
@@ -197,7 +220,6 @@ def main() -> None:
                 except (IndexError, ValueError): return
                 if _hello_already_seen(device_id, counter):
                     return
-                # _handle must see this first occurrence too; remove the marker and let it own state creation.
                 with _lock: _seen_hello.pop((device_id, counter), None)
             kind = wire[:1]
             try:
