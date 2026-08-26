@@ -25,6 +25,15 @@ static uint8_t s_status = ZIGBEE_OTA_STATUS_IDLE;
 static bool s_endpoint_registered;
 static bool s_monitor_started;
 static bool s_initial_report_started;
+/*
+ * esp_zb_zcl_set_manufacturer_attribute_val() generates the same SET_ATTR
+ * callback path as a remote Zigbee write on this stack.  Without this guard an
+ * internal state/readback update is mistaken for a new HA command, which in
+ * turn creates another apply task and another state write (feedback loop).
+ */
+static volatile bool s_internal_enable_attr_write;
+/* Monotonic generation: only the most recent HA enable/disable command may act. */
+static volatile uint32_t s_enable_generation;
 
 static bool network_ready(void)
 {
@@ -47,9 +56,12 @@ static void set_manufacturer_attr_locked(uint16_t cluster_id, uint16_t attr_id, 
         ESP_LOGW(TAG, "set manufacturer attr skipped: Zigbee lock acquire failed cluster=0x%04x attr=0x%04x", cluster_id, attr_id);
         return;
     }
+    const bool enable_attr = cluster_id == ZIGBEE_OTA_ENABLE_CLUSTER_ID && attr_id == ZIGBEE_OTA_ENABLE_ATTR_ID;
+    if (enable_attr) s_internal_enable_attr_write = true;
     esp_zb_zcl_status_t st = esp_zb_zcl_set_manufacturer_attribute_val(
         ZIGBEE_OTA_CONTROL_ENDPOINT, cluster_id, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
         ZIGBEE_OTA_CONTROL_MANUFACTURER_CODE, attr_id, value, false);
+    if (enable_attr) s_internal_enable_attr_write = false;
     esp_zb_lock_release();
     if (st != ESP_ZB_ZCL_STATUS_SUCCESS)
         ESP_LOGW(TAG, "set manufacturer attr failed cluster=0x%04x attr=0x%04x status=0x%x", cluster_id, attr_id, st);
@@ -71,6 +83,7 @@ void zigbee_ota_control_set_status(zigbee_ota_status_t status)
 
     if (provisioning_terminal(status) && s_enable_ota) {
         s_enable_ota = false;
+        ++s_enable_generation; /* invalidate any delayed ON/OFF worker */
         set_manufacturer_attr_locked(ZIGBEE_OTA_ENABLE_CLUSTER_ID, ZIGBEE_OTA_ENABLE_ATTR_ID, &s_enable_ota);
         ESP_LOGI(TAG, "Enable OTA=0 after terminal provisioning status=0x%02x", (unsigned)s_status);
     }
@@ -90,6 +103,7 @@ void zigbee_ota_control_set_enabled(bool enabled)
     s_enable_ota = enabled;
 
     if (changed) {
+        ++s_enable_generation;
         set_manufacturer_attr_locked(ZIGBEE_OTA_ENABLE_CLUSTER_ID, ZIGBEE_OTA_ENABLE_ATTR_ID, &s_enable_ota);
         ESP_LOGI(TAG, "Enable OTA=%u", s_enable_ota ? 1U : 0U);
         publish_state();
@@ -107,6 +121,7 @@ static void initial_report_task(void *arg)
     while (!network_ready()) vTaskDelay(pdMS_TO_TICKS(INITIAL_REPORT_RETRY_MS));
     s_enable_ota = false;
     s_status = ZIGBEE_OTA_STATUS_IDLE;
+    ++s_enable_generation;
     set_manufacturer_attr_locked(ZIGBEE_OTA_ENABLE_CLUSTER_ID, ZIGBEE_OTA_ENABLE_ATTR_ID, &s_enable_ota);
     set_manufacturer_attr_locked(ZIGBEE_OTA_STATUS_CLUSTER_ID, ZIGBEE_OTA_STATUS_ATTR_ID, &s_status);
     for (unsigned attempt = 1; attempt <= INITIAL_REPORT_REPEAT_COUNT; ++attempt) {
@@ -154,9 +169,16 @@ static void ota_status_monitor_task(void *arg)
 
 static void apply_enable_task(void *arg)
 {
-    const bool enabled = (uintptr_t)arg != 0;
+    const uint32_t generation = (uint32_t)(uintptr_t)arg;
     vTaskDelay(pdMS_TO_TICKS(20));
-    if (enabled != s_enable_ota) { vTaskDelete(NULL); return; }
+    if (generation != s_enable_generation) {
+        ESP_LOGD(TAG, "stale Enable OTA apply ignored generation=%u current=%u",
+                 (unsigned)generation, (unsigned)s_enable_generation);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    const bool enabled = s_enable_ota;
     publish_state();
     if (enabled) {
         ota_secure_session_begin_reprovisioning();
@@ -202,11 +224,21 @@ esp_err_t zigbee_ota_control_add_endpoint(esp_zb_ep_list_t *ep_list)
 bool zigbee_ota_control_handle_set_attr(const esp_zb_zcl_set_attr_value_message_t *message)
 {
     if (message == NULL || message->info.status != ESP_ZB_ZCL_STATUS_SUCCESS || message->info.dst_endpoint != ZIGBEE_OTA_CONTROL_ENDPOINT || message->info.cluster != ZIGBEE_OTA_ENABLE_CLUSTER_ID || message->attribute.id != ZIGBEE_OTA_ENABLE_ATTR_ID) return false;
+
+    if (s_internal_enable_attr_write) {
+        ESP_LOGD(TAG, "internal Enable OTA attribute callback ignored");
+        return true;
+    }
+
     jarzem_ota_hook_rx_from_ha();
     if (message->attribute.data.type != ESP_ZB_ZCL_ATTR_TYPE_BOOL || message->attribute.data.value == NULL) { ESP_LOGW(TAG, "Enable OTA rejected: invalid type/value"); return true; }
-    s_enable_ota = *(bool *)message->attribute.data.value;
-    ESP_LOGI(TAG, "Enable OTA write received=%u", s_enable_ota ? 1U : 0U);
-    if (xTaskCreate(apply_enable_task, "ota_enable", 3072, (void *)(uintptr_t)(s_enable_ota ? 1U : 0U), 5, NULL) != pdPASS) ESP_LOGW(TAG, "Enable OTA apply task creation failed");
+
+    const bool requested = *(bool *)message->attribute.data.value;
+    s_enable_ota = requested;
+    const uint32_t generation = ++s_enable_generation;
+    ESP_LOGI(TAG, "Enable OTA write received=%u generation=%u", requested ? 1U : 0U, (unsigned)generation);
+    if (xTaskCreate(apply_enable_task, "ota_enable", 3072, (void *)(uintptr_t)generation, 5, NULL) != pdPASS)
+        ESP_LOGW(TAG, "Enable OTA apply task creation failed");
     return true;
 }
 
