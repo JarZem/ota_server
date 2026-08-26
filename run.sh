@@ -57,7 +57,7 @@ echo "MQTT listener running pid=$MQTT_PID"
 echo "MQTT boot status listener running pid=$STATUS_PID"
 echo "MQTT activity observer running pid=$OBSERVER_PID"
 
-python3 "$RUNTIME_DIR/server_mysql.py" &
+python3 "$RUNTIME_DIR/live_server_mysql.py" &
 SERVER_PID=$!
 
 while kill -0 "$SERVER_PID" 2>/dev/null; do
