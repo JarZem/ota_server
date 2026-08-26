@@ -192,6 +192,7 @@ def render_ingress_tables() -> str:
 <script>
 if (!window.__otaLiveRefreshInstalled) {{
   window.__otaLiveRefreshInstalled = true;
+  window.__otaActivityFilter = window.__otaActivityFilter || 'ALL';
 
   function otaApplyActivityFilter(root, filter) {{
     if (!root || !filter) return;
@@ -204,8 +205,9 @@ if (!window.__otaLiveRefreshInstalled) {{
   document.addEventListener('click', event => {{
     const button = event.target.closest('.ota-filter');
     if (!button) return;
+    window.__otaActivityFilter = button.dataset.filter || 'ALL';
     const panel = button.closest('.ota-main-panel') || document;
-    otaApplyActivityFilter(panel, button.dataset.filter);
+    otaApplyActivityFilter(panel, window.__otaActivityFilter);
   }});
 
   async function otaRefreshVisiblePanel() {{
@@ -218,7 +220,6 @@ if (!window.__otaLiveRefreshInstalled) {{
 
     const pageX = window.scrollX;
     const pageY = window.scrollY;
-    const filter = current.querySelector('.ota-filter.active')?.dataset.filter || null;
     const wraps = Array.from(current.querySelectorAll('.table-wrap')).map(w => ({{left:w.scrollLeft, top:w.scrollTop}}));
 
     try {{
@@ -229,7 +230,7 @@ if (!window.__otaLiveRefreshInstalled) {{
       const fresh = freshDoc.querySelector('.ota-main-panel[data-main-panel="' + CSS.escape(name) + '"]');
       if (!fresh) return;
       current.innerHTML = fresh.innerHTML;
-      if (filter) otaApplyActivityFilter(current, filter);
+      if (name === 'activity') otaApplyActivityFilter(current, window.__otaActivityFilter || 'ALL');
       current.querySelectorAll('.table-wrap').forEach((w, i) => {{
         if (wraps[i]) {{ w.scrollLeft = wraps[i].left; w.scrollTop = wraps[i].top; }}
       }});
