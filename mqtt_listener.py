@@ -161,23 +161,15 @@ def session_timeout_loop():
 
 def extract_protocol_payload(message, base_topic):
     parts = message.topic.split("/")
-
-    if len(parts) == 3 and parts[0] == base_topic and parts[2] == "action":
-        try:
-            payload = message.payload.decode("utf-8").strip()
-        except UnicodeDecodeError:
-            return None, None
+    if len(parts) != 2 or parts[0] != base_topic:
+        return None, None
+    try:
+        state = json.loads(message.payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
+        return None, None
+    payload = state.get("ota_transport") if isinstance(state, dict) else None
+    if isinstance(payload, str) and payload:
         return parts[1], payload
-
-    if len(parts) == 2 and parts[0] == base_topic:
-        try:
-            state = json.loads(message.payload.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
-            return None, None
-        payload = state.get("ota_transport") if isinstance(state, dict) else None
-        if isinstance(payload, str) and payload:
-            return parts[1], payload
-
     return None, None
 
 
@@ -224,12 +216,9 @@ def build_client(base_topic, expected_ecosystem, options):
             log_error(f"MQTT connect failed: {reason_code}")
             return
         state_topic = f"{base_topic}/+"
-        action_topic = f"{base_topic}/+/action"
         client.subscribe(state_topic, qos=0)
-        client.subscribe(action_topic, qos=0)
         log_zigbee(f"listener subscribed topic={state_topic} field=ota_transport")
-        log_zigbee(f"compatibility listener subscribed topic={action_topic}")
-        log_internal("provisioning state machine ready: new authenticated HELLO may restart an unfinished attempt; provisioning context changes only after ESP confirms completion")
+        log_internal("provisioning state machine ready: one authenticated HELLO starts one attempt; additional HELLO frames are ignored until completion or timeout")
 
     def on_publish(client, userdata, mid, reason_code=None, properties=None):
         with pending_lock:
@@ -310,6 +299,12 @@ def build_client(base_topic, expected_ecosystem, options):
             return
 
         log_zigbee(f"RX H <- device_id={device_id} bytes={len(payload)}")
+        with pending_lock:
+            active = pending_sessions.get(device_id)
+        if active is not None:
+            log_internal(f"H ignored device_id={device_id}; provisioning already active state={active.state} counter={active.counter}")
+            return
+
         try:
             hello = verify_single_hello(payload, topic_device, expected_ecosystem)
         except Exception as exc:
@@ -329,12 +324,11 @@ def build_client(base_topic, expected_ecosystem, options):
             return
 
         with pending_lock:
-            previous = pending_sessions.get(device_id)
+            if pending_sessions.get(device_id) is not None:
+                log_internal(f"H ignored after concurrent session start device_id={device_id}")
+                return
             pending_sessions[device_id] = session
-        if previous is not None:
-            log_internal(f"new authenticated H replaced unfinished attempt device_id={device_id} old_state={previous.state} old_counter={previous.counter} new_counter={session.counter}")
-        else:
-            log_internal(f"new provisioning attempt accepted device_id={device_id} counter={session.counter}")
+        log_internal(f"new provisioning attempt accepted device_id={device_id} counter={session.counter}")
 
         log_crypto(f"A signed ECDSA-P256 random_bytes=8 wire_bytes={len(session.challenge_wire)} session_key=ECDH+counter+random")
         try:
