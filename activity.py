@@ -141,10 +141,10 @@ def render_ingress_tables() -> str:
         device_fw = conn.execute("SELECT * FROM device_firmware_status ORDER BY updated_at DESC LIMIT 100").fetchall()
 
     event_rows = ''.join(
-        '<tr class="ota-event ota-cat-{cat} ota-sev-{sev}" data-cat="{cat}"><td class="ota-time">{time}</td><td><span class="ota-badge">{cat}</span></td><td>{action}</td><td><code>{dev}</code></td><td>{detail}</td></tr>'.format(
-            cat=_e(_display_category(r['category'])), sev=_e(str(r['severity']).lower()), time=_e(_compact_time(r['created_at'])),
+        '<tr class="ota-event ota-cat-{cat} ota-sev-{sev}" data-id="{id}" data-cat="{cat}"><td class="ota-time">{time}</td><td><span class="ota-badge">{cat}</span></td><td>{action}</td><td><code>{dev}</code></td><td>{detail}</td></tr>'.format(
+            id=int(r['id']), cat=_e(_display_category(r['category'])), sev=_e(str(r['severity']).lower()), time=_e(_compact_time(r['created_at'])),
             action=_e(r['action']), dev=_e(r['device_id']), detail=_e(r['detail'])) for r in events
-    ) or '<tr><td colspan="5">No activity yet.</td></tr>'
+    ) or '<tr class="ota-empty"><td colspan="5">No activity yet.</td></tr>'
 
     artifact_rows = ''.join('<tr><td>{}</td><td>{}</td><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td></tr>'.format(
         _e(_compact_time(r['converter_published_at'] or r['published_at'])), _e(r['firmware_version']), _e(str(r['firmware_sha256'])[:12]),
@@ -193,12 +193,11 @@ def render_ingress_tables() -> str:
 <button type="button" class="ota-filter" data-filter="PROV">PROV</button><button type="button" class="ota-filter" data-filter="CHECK">CHECK</button>
 <button type="button" class="ota-filter" data-filter="DOWNLOAD">DOWNLOAD</button><button type="button" class="ota-filter" data-filter="MQTT">MQTT</button>
 </div>
-<div class="table-wrap ota-log"><table><thead><tr><th>Time</th><th>What</th><th>Event</th><th>ESP</th><th>Detail</th></tr></thead><tbody>{event_rows}</tbody></table></div>
+<div class="table-wrap ota-log"><table><thead><tr><th>Time</th><th>What</th><th>Event</th><th>ESP</th><th>Detail</th></tr></thead><tbody id="ota-activity-body">{event_rows}</tbody></table></div>
 <script>
-if (!window.__otaLiveRefreshInstalled) {{
-  window.__otaLiveRefreshInstalled = true;
+if (!window.__otaSseInstalled) {{
+  window.__otaSseInstalled = true;
   window.__otaActivityFilter = window.__otaActivityFilter || 'ALL';
-  window.__otaRefreshBusy = false;
 
   function otaApplyActivityFilter(root, filter) {{
     if (!root || !filter) return;
@@ -213,49 +212,54 @@ if (!window.__otaLiveRefreshInstalled) {{
     if (!button) return;
     event.preventDefault();
     window.__otaActivityFilter = button.dataset.filter || 'ALL';
-    const panel = button.closest('.ota-main-panel') || document;
-    otaApplyActivityFilter(panel, window.__otaActivityFilter);
+    otaApplyActivityFilter(document, window.__otaActivityFilter);
   }});
 
-  async function otaRefreshVisiblePanel() {{
-    if (document.hidden || window.__otaRefreshBusy) return;
-    const current = document.querySelector('.ota-main-panel.active');
-    if (!current || !current.dataset.mainPanel) return;
-    const name = current.dataset.mainPanel;
-    const focused = document.activeElement;
-    if (focused && current.contains(focused) && /^(INPUT|SELECT|TEXTAREA)$/.test(focused.tagName)) return;
-
-    const pageX = window.scrollX;
-    const pageY = window.scrollY;
-    const wraps = Array.from(current.querySelectorAll('.table-wrap')).map(w => ({{left:w.scrollLeft, top:w.scrollTop}}));
-    window.__otaRefreshBusy = true;
-
-    try {{
-      const response = await fetch(window.location.href, {{cache:'no-store', credentials:'same-origin'}});
-      if (!response.ok) return;
-      const text = await response.text();
-      const freshDoc = new DOMParser().parseFromString(text, 'text/html');
-      const fresh = freshDoc.querySelector('.ota-main-panel[data-main-panel="' + CSS.escape(name) + '"]');
-      if (!fresh) return;
-
-      const currentBodies = current.querySelectorAll('table tbody');
-      const freshBodies = fresh.querySelectorAll('table tbody');
-      currentBodies.forEach((tbody, i) => {{
-        if (freshBodies[i]) tbody.innerHTML = freshBodies[i].innerHTML;
-      }});
-
-      if (name === 'activity') otaApplyActivityFilter(current, window.__otaActivityFilter || 'ALL');
-      current.querySelectorAll('.table-wrap').forEach((w, i) => {{
-        if (wraps[i]) {{ w.scrollLeft = wraps[i].left; w.scrollTop = wraps[i].top; }}
-      }});
-      window.scrollTo(pageX, pageY);
-    }} catch (_) {{
-    }} finally {{
-      window.__otaRefreshBusy = false;
-    }}
+  function otaActivityLastId() {{
+    let maxId = 0;
+    document.querySelectorAll('#ota-activity-body .ota-event[data-id]').forEach(row => {{
+      const id = Number(row.dataset.id || 0);
+      if (id > maxId) maxId = id;
+    }});
+    return maxId;
   }}
 
-  window.setInterval(otaRefreshVisiblePanel, 1500);
+  function otaCell(text, code) {{
+    const td = document.createElement('td');
+    if (code) {{ const c = document.createElement('code'); c.textContent = text || ''; td.appendChild(c); }}
+    else td.textContent = text || '';
+    return td;
+  }}
+
+  function otaInsertActivity(item) {{
+    const tbody = document.getElementById('ota-activity-body');
+    if (!tbody || !item || !item.id) return;
+    if (tbody.querySelector('.ota-event[data-id="' + String(item.id) + '"]')) return;
+    tbody.querySelectorAll('.ota-empty').forEach(x => x.remove());
+
+    const row = document.createElement('tr');
+    const cat = item.category === 'REG' ? 'CERT' : (item.category || 'OTHER');
+    row.className = 'ota-event ota-cat-' + cat + ' ota-sev-' + String(item.severity || 'INFO').toLowerCase();
+    row.dataset.id = String(item.id);
+    row.dataset.cat = cat;
+    row.appendChild(otaCell(item.time || '', false));
+    const what = document.createElement('td');
+    const badge = document.createElement('span'); badge.className = 'ota-badge'; badge.textContent = cat; what.appendChild(badge); row.appendChild(what);
+    row.appendChild(otaCell(item.action || '', false));
+    row.appendChild(otaCell(item.device_id || '', true));
+    row.appendChild(otaCell(item.detail || '', false));
+    tbody.insertBefore(row, tbody.firstChild);
+    while (tbody.querySelectorAll('.ota-event').length > 100) tbody.lastElementChild.remove();
+    otaApplyActivityFilter(document, window.__otaActivityFilter || 'ALL');
+  }}
+
+  const after = otaActivityLastId();
+  const streamUrl = new URL('./events', window.location.href);
+  streamUrl.searchParams.set('after', String(after));
+  const source = new EventSource(streamUrl.toString(), {{withCredentials:true}});
+  source.addEventListener('activity', event => {{
+    try {{ otaInsertActivity(JSON.parse(event.data)); }} catch (_) {{}}
+  }});
 }}
 </script>
 </section>
