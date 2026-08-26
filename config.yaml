@@ -1,0 +1,68 @@
+name: "OTA Server"
+version: "0.1.50"
+slug: "ota_server"
+description: "OTA server"
+
+arch:
+  - amd64
+
+startup: services
+boot: auto
+
+ports:
+  8443/tcp: 8443
+  8451/tcp: 8451
+
+map:
+  - type: share
+    read_only: false
+  - type: addons
+    read_only: true
+
+homeassistant_api: true
+hassio_api: true
+
+services:
+  - mqtt:need
+
+stdin: true
+ingress: true
+ingress_port: 8099
+
+panel_icon: mdi:update
+panel_title: "OTA server"
+panel_admin: true
+
+options:
+  ota_ecosystem: "JaroslavZemanESP"
+  wifi_ssid: "zeman"
+  wifi_password_secret: "main_wifi"
+  wifi_security: "WPA2"
+  wifi_channel: 13
+  ota_host: "192.168.2.120"
+  ota_port: 8443
+  mqtt_host: "core-mosquitto"
+  mqtt_port: 1883
+  mqtt_base_topic: "zigbee2mqtt"
+  mysql_host: "core-mariadb"
+  mysql_port: 3306
+  mysql_database: homeassistant
+  mysql_username: homeassistant
+  mysql_password_secret: homeassistant_mysql
+
+schema:
+  ota_ecosystem: str
+  wifi_ssid: str
+  wifi_password_secret: str
+  wifi_security: str
+  wifi_channel: int
+  ota_host: str
+  ota_port: port
+  mqtt_host: str
+  mqtt_port: int
+  mqtt_base_topic: str
+  mysql_host: str
+  mysql_port: int
+  mysql_database: str
+  mysql_username: str
+  mysql_password_secret: str

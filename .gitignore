@@ -1,0 +1,15 @@
+# Lokální zálohy
+.backup/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Markdown dokumentace generovaná Copilotem
+*.md
+!README.md
+
+# Vygenerované certifikáty a privátní klíče
+cert/
+*.key
+*.pem
