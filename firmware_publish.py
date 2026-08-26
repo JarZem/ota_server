@@ -12,7 +12,7 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 
-from activity import record_firmware_publish
+from activity import record_activity, record_firmware_publish
 from device_registry import register_device_certificate, verify_and_extract_device_certificate
 
 FIRMWARE_DIR = Path('/share/ota_server/firmware')
@@ -39,12 +39,6 @@ def _send_json(handler, status: int, payload: dict) -> None:
 
 
 def _validated_publisher(encoded_cert: str) -> tuple[x509.Certificate, dict, bytes]:
-    """Validate supplied publisher certificate against the configured Root CA.
-
-    Publishing itself never depends on prior runtime registration.  The exact same
-    already-validated public certificate can however safely repopulate the device
-    registry afterwards, so a runtime-state reset cannot strand provisioning.
-    """
     certificate_pem = _b64url_decode(encoded_cert)
     extracted = verify_and_extract_device_certificate(certificate_pem)
     cert = x509.load_pem_x509_certificate(certificate_pem)
@@ -156,10 +150,12 @@ def handle_publish(handler) -> None:
         cert.public_key().verify(signature, canonical, ec.ECDSA(hashes.SHA256()))
         release = _validate_metadata(metadata, expected_sha, length, publisher)
 
-        # Re-populate the public device certificate registry only after the request
-        # signature and all certificate-bound metadata are valid.  No private key is
-        # transferred and firmware publishing still does not require registration.
         registration = register_device_certificate(certificate_pem)
+        record_activity(
+            'REG', f"Certificate {registration['registration_action']}",
+            device_id=publisher['device_id'],
+            detail=f"fingerprint={publisher['certificate_fingerprint'][:16]} model={publisher.get('device_model') or 'unknown'} role={publisher.get('product_role') or 'unknown'}",
+        )
 
         target = FIRMWARE_DIR / filename
         release_path = FIRMWARE_DIR / (target.stem + '.release.json')
