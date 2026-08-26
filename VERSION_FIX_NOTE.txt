@@ -1,0 +1,1 @@
+OTA add-on 0.1.49 includes certificate-only BIN publish and corrected Zigbee2MQTT converter publisher tuple handling.
