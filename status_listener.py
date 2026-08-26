@@ -46,20 +46,14 @@ def b64url_decode(value):
 
 def extract_status(message, base_topic):
     parts = message.topic.split('/')
-    if len(parts) == 3 and parts[0] == base_topic and parts[2] == 'action':
-        try:
-            payload = message.payload.decode('utf-8').strip()
-        except UnicodeDecodeError:
-            return None, None
-        return parts[1], payload if payload.startswith('S|') else None
-    if len(parts) == 2 and parts[0] == base_topic:
-        try:
-            state = json.loads(message.payload.decode('utf-8'))
-        except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
-            return None, None
-        payload = state.get('ota_transport') if isinstance(state, dict) else None
-        return parts[1], payload if isinstance(payload, str) and payload.startswith('S|') else None
-    return None, None
+    if len(parts) != 2 or parts[0] != base_topic:
+        return None, None
+    try:
+        state = json.loads(message.payload.decode('utf-8'))
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
+        return None, None
+    payload = state.get('ota_transport') if isinstance(state, dict) else None
+    return parts[1], payload if isinstance(payload, str) and payload.startswith('S|') else None
 
 
 def verify_and_store(topic_device, payload, expected_ecosystem):
@@ -116,7 +110,6 @@ def main():
             print(f'[OTA/STATUS] MQTT connect failed: {reason_code}', flush=True)
             return
         client.subscribe(f'{base_topic}/+', qos=0)
-        client.subscribe(f'{base_topic}/+/action', qos=0)
         print(f'[OTA/STATUS] listening for signed boot STATUS on {base_topic}/+', flush=True)
 
     def on_message(client, userdata, message):
