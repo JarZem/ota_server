@@ -11,7 +11,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 
-from activity import firmware_device_state
+from activity import firmware_device_state, provisioning_state
 from device_registry import accept_hello_counter, get_registered_device, normalize_device_id
 from ota_check_security import confirm_completed_download_b64, save_provisioning_context
 from secure_transport import build_challenge, build_provisioning, verify_response
@@ -91,6 +91,14 @@ def b64url_decode(value):
     return base64.urlsafe_b64decode(value + ("=" * ((-len(value)) % 4)))
 
 
+def hello_counter(payload):
+    try:
+        parts = payload.split("|", 2)
+        return int(parts[1], 10) if len(parts) == 3 and parts[0] == "H" else None
+    except (TypeError, ValueError):
+        return None
+
+
 def verify_single_hello(payload, topic_device, expected_ecosystem):
     parts = payload.split("|")
     if len(parts) != 3 or parts[0] != "H":
@@ -151,12 +159,14 @@ def session_timeout_loop():
     while True:
         time.sleep(1)
         now = time.monotonic()
+        expired = []
         with pending_lock:
-            expired = [device_id for device_id, s in pending_sessions.items()
-                       if now - s.created_mono >= SESSION_TIMEOUT_SECONDS]
-            for device_id in expired:
-                s = pending_sessions.pop(device_id)
-                log_error(f"session timeout device_id={device_id} state={s.state} counter={s.counter}; current attempt discarded")
+            for device_id, session in list(pending_sessions.items()):
+                if now - session.created_mono >= SESSION_TIMEOUT_SECONDS:
+                    expired.append((device_id, pending_sessions.pop(device_id)))
+        for device_id, session in expired:
+            log_error(f"session timeout device_id={device_id} state={session.state} counter={session.counter}; accepted attempt discarded")
+            provisioning_state(device_id, session.counter, "TIMEOUT", f"waiting in {session.state}")
 
 
 def extract_protocol_payload(message, base_topic):
@@ -198,8 +208,10 @@ def handle_control_state(device_id, payload):
         save_provisioning_context(device_id, session.counter, session.random8)
     except Exception as exc:
         log_error(f"provisioning completed on ESP but durable OTA context save failed device_id={device_id}: {exc}")
+        provisioning_state(device_id, session.counter, "ERROR", f"durable context save failed: {exc}")
         return True
 
+    provisioning_state(device_id, session.counter, "COMPLETED")
     log_verify(f"provisioning completed device_id={device_id} counter={session.counter}; durable context updated; server returned to idle")
     return True
 
@@ -218,7 +230,7 @@ def build_client(base_topic, expected_ecosystem, options):
         state_topic = f"{base_topic}/+"
         client.subscribe(state_topic, qos=0)
         log_zigbee(f"listener subscribed topic={state_topic} field=ota_transport")
-        log_internal("provisioning state machine ready: one authenticated HELLO starts one attempt; additional HELLO frames are ignored until completion or timeout")
+        log_internal("provisioning state machine ready: only an authenticated HELLO creates an active attempt; timeout applies only after acceptance")
 
     def on_publish(client, userdata, mid, reason_code=None, properties=None):
         with pending_lock:
@@ -275,8 +287,13 @@ def build_client(base_topic, expected_ecosystem, options):
             log_zigbee(f"RX R <- device_id={device_id} state=WAIT_RESPONSE bytes={len(payload)}")
             if not verify_response(session, payload):
                 log_error(f"R signature rejected device_id={device_id} counter={session.counter}")
+                with pending_lock:
+                    if pending_sessions.get(device_id) is session:
+                        pending_sessions.pop(device_id, None)
+                provisioning_state(device_id, session.counter, "ERROR", "R signature rejected")
                 return
 
+            provisioning_state(device_id, session.counter, "RESPONSE_SEEN")
             with pending_lock:
                 current = pending_sessions.get(device_id)
                 if current is not session or current.state != "WAIT_RESPONSE":
@@ -290,12 +307,14 @@ def build_client(base_topic, expected_ecosystem, options):
                 wire = build_provisioning(session, **config)
                 log_crypto(f"P encrypted AES-256-GCM device_id={device_id} counter={session.counter} bytes={len(wire)}")
                 publish_command(client, base_topic, topic_device, wire, "P-provisioning", device_id)
+                provisioning_state(device_id, session.counter, "PROVISIONING_SENT")
                 log_internal(f"P queued device_id={device_id} counter={session.counter}; waiting for ESP completion confirmation before replacing durable context")
             except Exception as exc:
                 log_error(f"P creation/send failed device_id={device_id}: {exc}")
                 with pending_lock:
                     if pending_sessions.get(device_id) is session:
                         pending_sessions.pop(device_id, None)
+                provisioning_state(device_id, session.counter, "ERROR", f"P creation/send failed: {exc}")
             return
 
         log_zigbee(f"RX H <- device_id={device_id} bytes={len(payload)}")
@@ -305,15 +324,19 @@ def build_client(base_topic, expected_ecosystem, options):
             log_internal(f"H ignored device_id={device_id}; provisioning already active state={active.state} counter={active.counter}")
             return
 
+        raw_counter = hello_counter(payload)
         try:
             hello = verify_single_hello(payload, topic_device, expected_ecosystem)
         except Exception as exc:
             log_error(f"H rejected device_id={device_id}: {exc}")
+            if raw_counter and raw_counter > 0:
+                provisioning_state(device_id, raw_counter, "ERROR", f"HELLO rejected: {exc}")
             return
         if hello["status"] == "STALE":
             log_internal(f"H ignored as stale/replayed device_id={device_id} counter={hello['counter']}")
             return
 
+        provisioning_state(device_id, hello["counter"], "HELLO_SEEN")
         registered = hello["registered"]
         log_verify(f"H CA/certificate/ECDSA/counter OK device_id={device_id} counter={hello['counter']}")
         try:
@@ -321,6 +344,7 @@ def build_client(base_topic, expected_ecosystem, options):
                                       registered["public_key_der"], time.monotonic())
         except Exception as exc:
             log_error(f"A creation failed device_id={device_id}: {exc}")
+            provisioning_state(device_id, hello["counter"], "ERROR", f"A creation failed: {exc}")
             return
 
         with pending_lock:
@@ -333,11 +357,13 @@ def build_client(base_topic, expected_ecosystem, options):
         log_crypto(f"A signed ECDSA-P256 random_bytes=8 wire_bytes={len(session.challenge_wire)} session_key=ECDH+counter+random")
         try:
             publish_command(client, base_topic, topic_device, session.challenge_wire, "A-challenge", device_id)
+            provisioning_state(device_id, session.counter, "CHALLENGE_SENT")
         except Exception as exc:
             log_error(f"A MQTT publish failed device_id={device_id}: {exc}")
             with pending_lock:
                 if pending_sessions.get(device_id) is session:
                     pending_sessions.pop(device_id, None)
+            provisioning_state(device_id, session.counter, "ERROR", f"A MQTT publish failed: {exc}")
 
     client.on_connect = on_connect
     client.on_publish = on_publish
