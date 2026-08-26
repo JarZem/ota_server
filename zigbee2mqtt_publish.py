@@ -217,12 +217,10 @@ def handle_zigbee2mqtt_publish(handler) -> None:
             raise ValueError("zigbee2mqtt_firmware_build_marker_mismatch")
         code = data.decode("utf-8")
         digest = hashlib.sha256(expected_name.encode() + b"\0" + data + b"\0").hexdigest()
-        cert, publisher, _registered = _validated_publisher(str(request.get("certificate") or ""))
+        cert, publisher = _validated_publisher(str(request.get("certificate") or ""))
         signature = _b64url_decode(str(request.get("signature") or ""))
         cert.public_key().verify(signature, PUBLISH_DOMAIN + project.encode() + b"|" + digest.encode(), ec.ECDSA(hashes.SHA256()))
 
-        # MJS is accepted only after a signed BIN from the same build and publisher
-        # has already been verified and persisted by the OTA server.
         require_verified_firmware_publication(version, publisher['device_id'])
 
         options = _load_options()
