@@ -198,6 +198,7 @@ def render_ingress_tables() -> str:
 if (!window.__otaLiveRefreshInstalled) {{
   window.__otaLiveRefreshInstalled = true;
   window.__otaActivityFilter = window.__otaActivityFilter || 'ALL';
+  window.__otaRefreshBusy = false;
 
   function otaApplyActivityFilter(root, filter) {{
     if (!root || !filter) return;
@@ -210,13 +211,14 @@ if (!window.__otaLiveRefreshInstalled) {{
   document.addEventListener('click', event => {{
     const button = event.target.closest('.ota-filter');
     if (!button) return;
+    event.preventDefault();
     window.__otaActivityFilter = button.dataset.filter || 'ALL';
     const panel = button.closest('.ota-main-panel') || document;
     otaApplyActivityFilter(panel, window.__otaActivityFilter);
   }});
 
   async function otaRefreshVisiblePanel() {{
-    if (document.hidden) return;
+    if (document.hidden || window.__otaRefreshBusy) return;
     const current = document.querySelector('.ota-main-panel.active');
     if (!current || !current.dataset.mainPanel) return;
     const name = current.dataset.mainPanel;
@@ -226,6 +228,7 @@ if (!window.__otaLiveRefreshInstalled) {{
     const pageX = window.scrollX;
     const pageY = window.scrollY;
     const wraps = Array.from(current.querySelectorAll('.table-wrap')).map(w => ({{left:w.scrollLeft, top:w.scrollTop}}));
+    window.__otaRefreshBusy = true;
 
     try {{
       const response = await fetch(window.location.href, {{cache:'no-store', credentials:'same-origin'}});
@@ -234,13 +237,22 @@ if (!window.__otaLiveRefreshInstalled) {{
       const freshDoc = new DOMParser().parseFromString(text, 'text/html');
       const fresh = freshDoc.querySelector('.ota-main-panel[data-main-panel="' + CSS.escape(name) + '"]');
       if (!fresh) return;
-      current.innerHTML = fresh.innerHTML;
+
+      const currentBodies = current.querySelectorAll('table tbody');
+      const freshBodies = fresh.querySelectorAll('table tbody');
+      currentBodies.forEach((tbody, i) => {{
+        if (freshBodies[i]) tbody.innerHTML = freshBodies[i].innerHTML;
+      }});
+
       if (name === 'activity') otaApplyActivityFilter(current, window.__otaActivityFilter || 'ALL');
       current.querySelectorAll('.table-wrap').forEach((w, i) => {{
         if (wraps[i]) {{ w.scrollLeft = wraps[i].left; w.scrollTop = wraps[i].top; }}
       }});
       window.scrollTo(pageX, pageY);
-    }} catch (_) {{}}
+    }} catch (_) {{
+    }} finally {{
+      window.__otaRefreshBusy = false;
+    }}
   }}
 
   window.setInterval(otaRefreshVisiblePanel, 1500);
