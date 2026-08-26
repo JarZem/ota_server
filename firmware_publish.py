@@ -96,8 +96,53 @@ def _validate_metadata(metadata: dict, sha256_hex: str, size: int,
     return result
 
 
-def handle_publish(handler) -> None:
+def _receive_firmware_body(handler, length: int) -> tuple[str, str]:
+    """Consume the complete accepted-size POST body before validating headers.
+
+    This is deliberate: closing the HTTPS socket while the Windows client is still
+    uploading a ~MB firmware body hides the useful HTTP 400 response behind
+    WinError 10053/connection reset.  Once the body is consumed, any certificate,
+    metadata or signature error can be returned to the build as normal JSON.
+    """
+    FIRMWARE_DIR.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix='.publish-', suffix='.bin', dir=FIRMWARE_DIR)
+    digest = hashlib.sha256()
+    remaining = length
     try:
+        with os.fdopen(fd, 'wb') as out:
+            while remaining:
+                block = handler.rfile.read(min(64 * 1024, remaining))
+                if not block:
+                    raise ValueError('truncated_firmware_body')
+                out.write(block)
+                digest.update(block)
+                remaining -= len(block)
+            out.flush()
+            os.fsync(out.fileno())
+        return temp_name, digest.hexdigest()
+    except Exception:
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
+        raise
+
+
+def handle_publish(handler) -> None:
+    temp_name = None
+    try:
+        try:
+            length = int(handler.headers.get('Content-Length', '0'))
+        except ValueError as exc:
+            raise ValueError('invalid_content_length') from exc
+        if length <= 0 or length > MAX_FIRMWARE_BYTES:
+            raise ValueError('invalid_firmware_size')
+
+        # For a sane firmware size always drain the full request first.  This
+        # guarantees that later validation failures reach urllib as HTTP errors
+        # instead of aborting an in-progress upload socket on Windows.
+        temp_name, actual_sha = _receive_firmware_body(handler, length)
+
         filename = str(handler.headers.get('X-Firmware-Filename') or '')
         expected_sha = str(handler.headers.get('X-Firmware-SHA256') or '').lower()
         metadata_b64 = str(handler.headers.get('X-Firmware-Metadata') or '')
@@ -108,12 +153,8 @@ def handle_publish(handler) -> None:
             raise ValueError('invalid_filename')
         if not _SHA_RE.fullmatch(expected_sha):
             raise ValueError('invalid_sha256')
-        try:
-            length = int(handler.headers.get('Content-Length', '0'))
-        except ValueError as exc:
-            raise ValueError('invalid_content_length') from exc
-        if length <= 0 or length > MAX_FIRMWARE_BYTES:
-            raise ValueError('invalid_firmware_size')
+        if actual_sha != expected_sha:
+            raise ValueError('firmware_sha256_mismatch')
 
         metadata_raw = _b64url_decode(metadata_b64)
         metadata = json.loads(metadata_raw.decode('utf-8'))
@@ -128,38 +169,13 @@ def handle_publish(handler) -> None:
         cert.public_key().verify(signature, canonical, ec.ECDSA(hashes.SHA256()))
         release = _validate_metadata(metadata, expected_sha, length, publisher, registered)
 
-        FIRMWARE_DIR.mkdir(parents=True, exist_ok=True)
-        fd, temp_name = tempfile.mkstemp(prefix='.publish-', suffix='.bin', dir=FIRMWARE_DIR)
-        digest = hashlib.sha256()
-        remaining = length
-        try:
-            with os.fdopen(fd, 'wb') as out:
-                while remaining:
-                    block = handler.rfile.read(min(64 * 1024, remaining))
-                    if not block:
-                        raise ValueError('truncated_firmware_body')
-                    out.write(block)
-                    digest.update(block)
-                    remaining -= len(block)
-                out.flush()
-                os.fsync(out.fileno())
-
-            actual_sha = digest.hexdigest()
-            if actual_sha != expected_sha:
-                raise ValueError('firmware_sha256_mismatch')
-
-            target = FIRMWARE_DIR / filename
-            release_path = FIRMWARE_DIR / (target.stem + '.release.json')
-            release_temp = release_path.with_suffix(release_path.suffix + '.tmp')
-            release_temp.write_text(json.dumps(release, indent=2, sort_keys=True) + '\n', encoding='utf-8')
-            os.replace(temp_name, target)
-            os.replace(release_temp, release_path)
-        except Exception:
-            try:
-                os.unlink(temp_name)
-            except OSError:
-                pass
-            raise
+        target = FIRMWARE_DIR / filename
+        release_path = FIRMWARE_DIR / (target.stem + '.release.json')
+        release_temp = release_path.with_suffix(release_path.suffix + '.tmp')
+        release_temp.write_text(json.dumps(release, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+        os.replace(temp_name, target)
+        temp_name = None
+        os.replace(release_temp, release_path)
 
         record_firmware_publish(
             version=release['firmware_version'], filename=filename, sha256=expected_sha,
@@ -175,5 +191,13 @@ def handle_publish(handler) -> None:
             'filename': filename, 'sha256': expected_sha, 'size': length,
         })
     except Exception as exc:
+        if temp_name:
+            try:
+                os.unlink(temp_name)
+            except OSError:
+                pass
         print(f'Firmware publish rejected: {exc}', flush=True)
-        _send_json(handler, 400, {'status': 'ERROR', 'error': str(exc)})
+        try:
+            _send_json(handler, 400, {'status': 'ERROR', 'error': str(exc)})
+        except (BrokenPipeError, ConnectionResetError, OSError) as send_exc:
+            print(f'Firmware publish error response could not be sent: {send_exc}', flush=True)
