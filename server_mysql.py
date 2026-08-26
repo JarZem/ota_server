@@ -240,7 +240,7 @@ def clear_maintenance_target(target: str) -> str:
     labels = {
         'activity': 'OTA activity', 'artifacts': 'BIN / MJS detail',
         'provisioning': 'Provisioning detail', 'firmware': 'ESP × firmware detail',
-        'esp': 'OTA ESP registry', 'images': 'Images metadata', 'tests': 'E2E test data',
+        'esp': 'OTA ESP runtime state', 'images': 'Images metadata', 'tests': 'E2E test data',
     }
     if target not in labels:
         raise ValueError('Unknown maintenance target')
@@ -255,10 +255,11 @@ def clear_maintenance_target(target: str) -> str:
         elif target == 'firmware':
             removed = _rowcount(conn.execute('DELETE FROM device_firmware_status'))
         elif target == 'esp':
-            # Reset only ESP/device-side OTA state; HA/Z2M device registry is untouched.
+            # Reset only transient ESP-side OTA state. The CA-validated public
+            # certificate is device identity and MUST survive a runtime reset.
             for table in (
                 'device_firmware_status', 'provisioning_attempts', 'device_provisioning',
-                'download_grants', 'ota_dispatch', 'devices', 'device_certificates',
+                'download_grants', 'ota_dispatch', 'devices',
             ):
                 removed += _rowcount(conn.execute(f'DELETE FROM {table}'))
             removed += _rowcount(conn.execute(
@@ -358,7 +359,7 @@ def page_html(message="", maintenance_target="", maintenance_message="", mainten
         _maintenance_button('tests', 'Smazat E2E testovací data', 'Smazat E2E testovací zařízení a všechna ota-e2e-* data ze všech OTA tabulek? Normální ESP a firmware zůstanou zachovány.'),
     )) + '</div>' + panel_messages['images']
     esp_tools = '<div class="ota-tab-tools">' + _maintenance_button(
-        'esp', 'Resetovat OTA ESP registry', 'POZOR: smaže OTA certifikační registry, provisioning a OTA stav zařízení. Home Assistant/Zigbee zařízení se nesmažou. Pokračovat?') + '</div>' + panel_messages['esp']
+        'esp', 'Resetovat OTA ESP runtime stav', 'Smaže provisioning a OTA runtime stav zařízení. Veřejné CA-ověřené certifikáty zůstanou zachovány. Pokračovat?') + '</div>' + panel_messages['esp']
 
     body = body.replace(
         '<h3>Firmware biny</h3>',
