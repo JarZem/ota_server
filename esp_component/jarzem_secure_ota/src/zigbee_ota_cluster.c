@@ -18,14 +18,13 @@
 #include "ota_config.h"
 #include "ota_secure_session.h"
 #include "ota_service.h"
-#include "status_led.h"
 #include "zigbee_ota_control.h"
 #include "zcl/esp_zigbee_zcl_common.h"
 
 static const char *TAG = "zigbee_ota_cluster";
 #define HELLO_WAIT_ATTEMPTS 30
 #define HELLO_SIGNATURE_B64_MAX 96
-#define HELLO_RETRY_MS 120000
+#define HELLO_TIMEOUT_MS 120000
 #define DIAG_PING "D|PING"
 #define DIAG_PONG "D|PONG"
 #define DIAG_LEN_PREFIX "D|LEN|"
@@ -126,7 +125,7 @@ static void zigbee_ota_ack_task(void *arg)
     if (ack != NULL) {
         vTaskDelay(pdMS_TO_TICKS(50));
         const esp_err_t err = zigbee_ota_send_command_payload(ack);
-        if (err == ESP_OK) status_led_indicate_provision_step();
+        if (err == ESP_OK) jarzem_ota_hook_provision_step();
         ESP_LOGI(TAG, "R response TX state=%s bytes=%u result=%s payload=%s",
                  ota_secure_session_state_name(), (unsigned)strlen(ack), esp_err_to_name(err), ack);
         memset(ack, 0, strlen(ack));
@@ -161,7 +160,7 @@ static bool process_secure_protocol(const char *payload)
                      ota_secure_session_state_name(), esp_err_to_name(err));
             return true;
         }
-        status_led_indicate_provision_step();
+        jarzem_ota_hook_provision_step();
         schedule_secure_ack(ack);
         memset(ack, 0, sizeof(ack));
         return true;
@@ -172,7 +171,7 @@ static bool process_secure_protocol(const char *payload)
             ESP_LOGW(TAG, "P dropped/rejected state=%s result=%s",
                      ota_secure_session_state_name(), esp_err_to_name(err));
         } else {
-            status_led_indicate_provision_step();
+            jarzem_ota_hook_provision_step();
             zigbee_ota_control_set_status(ZIGBEE_OTA_STATUS_PROVISIONING_COMPLETE);
             zigbee_ota_control_set_enabled(false);
             ESP_LOGI(TAG, "P complete state=%s; provisioning finished; Enable OTA -> 0",
@@ -390,36 +389,51 @@ static void zigbee_ota_hello_task(void *arg)
 {
     (void)arg;
     if (s_hello_delay_ms > 0) vTaskDelay(pdMS_TO_TICKS(s_hello_delay_ms));
-    while (zigbee_ota_control_is_enabled() && !ota_secure_session_is_provisioned()) {
-        bool network_ready = false;
-        for (unsigned attempt = 1;
-             attempt <= HELLO_WAIT_ATTEMPTS && zigbee_ota_control_is_enabled();
-             ++attempt) {
-            if (zigbee_ota_network_identity_valid()) {
-                network_ready = true;
-                break;
-            }
-            vTaskDelay(pdMS_TO_TICKS(1000));
+
+    if (!zigbee_ota_control_is_enabled()) goto done;
+
+    bool network_ready = false;
+    for (unsigned attempt = 1;
+         attempt <= HELLO_WAIT_ATTEMPTS && zigbee_ota_control_is_enabled();
+         ++attempt) {
+        if (zigbee_ota_network_identity_valid()) {
+            network_ready = true;
+            break;
         }
-        if (!zigbee_ota_control_is_enabled()) break;
-        ota_secure_session_reset_for_retry();
-        zigbee_ota_control_set_status(ZIGBEE_OTA_STATUS_PROVISIONING_STARTED);
-        if (network_ready) {
-            const esp_err_t err = send_secure_hello();
-            if (err == ESP_OK) status_led_indicate_provision_step();
-            if (err != ESP_OK) zigbee_ota_control_set_status(ZIGBEE_OTA_STATUS_PROVISIONING_ERROR);
-        } else {
-            zigbee_ota_control_set_status(ZIGBEE_OTA_STATUS_PROVISIONING_ERROR);
-        }
-        for (unsigned elapsed = 0; elapsed < HELLO_RETRY_MS; elapsed += 1000) {
-            if (!zigbee_ota_control_is_enabled() || ota_secure_session_is_provisioned()) break;
-            vTaskDelay(pdMS_TO_TICKS(1000));
-        }
-        if (!zigbee_ota_control_is_enabled() || ota_secure_session_is_provisioned()) break;
-        zigbee_ota_control_set_status(ZIGBEE_OTA_STATUS_PROVISIONING_TIMEOUT);
-        ota_secure_session_reset_for_retry();
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
-    if (!zigbee_ota_control_is_enabled()) {
+
+    if (!zigbee_ota_control_is_enabled()) goto done;
+
+    ota_secure_session_reset_for_retry();
+    zigbee_ota_control_set_status(ZIGBEE_OTA_STATUS_PROVISIONING_STARTED);
+
+    if (!network_ready) {
+        zigbee_ota_control_set_status(ZIGBEE_OTA_STATUS_PROVISIONING_ERROR);
+        goto done;
+    }
+
+    const esp_err_t err = send_secure_hello();
+    if (err == ESP_OK) {
+        jarzem_ota_hook_provision_step();
+    } else {
+        zigbee_ota_control_set_status(ZIGBEE_OTA_STATUS_PROVISIONING_ERROR);
+        goto done;
+    }
+
+    for (unsigned elapsed = 0; elapsed < HELLO_TIMEOUT_MS; elapsed += 1000) {
+        if (!zigbee_ota_control_is_enabled() || ota_secure_session_is_provisioned()) break;
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+
+    if (zigbee_ota_control_is_enabled() && !ota_secure_session_is_provisioned()) {
+        zigbee_ota_control_set_status(ZIGBEE_OTA_STATUS_PROVISIONING_TIMEOUT);
+    }
+
+done:
+    /* Never destroy a successfully provisioned session when Enable OTA was
+       automatically switched off after P. Reset only an unfinished attempt. */
+    if (!ota_secure_session_is_provisioned()) {
         ota_secure_session_reset_for_retry();
     }
     s_hello_task_started = false;
@@ -462,7 +476,7 @@ bool zigbee_ota_cluster_handle_set_attr(const esp_zb_zcl_set_attr_value_message_
         message->info.cluster != ZIGBEE_OTA_CLUSTER_ID ||
         message->attribute.id != ZIGBEE_OTA_CONFIG_ATTR_ID) return false;
 
-    status_led_indicate_ha_command();
+    jarzem_ota_hook_rx_from_ha();
     const esp_zb_zcl_attribute_data_t *data = &message->attribute.data;
     if (data->value == NULL || data->type != ESP_ZB_ZCL_ATTR_TYPE_OCTET_STRING || data->size < 1)
         return true;
@@ -481,7 +495,7 @@ bool zigbee_ota_cluster_handle_custom_cmd(const esp_zb_zcl_custom_cluster_comman
         message->info.cluster != ZIGBEE_OTA_CLUSTER_ID ||
         message->info.command.id != ZIGBEE_OTA_CMD_TO_DEVICE_ID) return false;
 
-    status_led_indicate_ha_command();
+    jarzem_ota_hook_rx_from_ha();
     if (message->data.value == NULL || message->data.size < 2) return true;
     const uint8_t *wire = (const uint8_t *)message->data.value;
     const size_t len = wire[0];
