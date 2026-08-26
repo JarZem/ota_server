@@ -189,6 +189,57 @@ def render_ingress_tables() -> str:
 <button type="button" class="ota-filter" data-filter="DOWNLOAD">DOWNLOAD</button><button type="button" class="ota-filter" data-filter="MQTT">MQTT</button>
 </div>
 <div class="table-wrap ota-log"><table><thead><tr><th>Time</th><th>What</th><th>Event</th><th>ESP</th><th>Detail</th></tr></thead><tbody>{event_rows}</tbody></table></div>
+<script>
+if (!window.__otaLiveRefreshInstalled) {{
+  window.__otaLiveRefreshInstalled = true;
+
+  function otaApplyActivityFilter(root, filter) {{
+    if (!root || !filter) return;
+    root.querySelectorAll('.ota-filter').forEach(x => x.classList.toggle('active', x.dataset.filter === filter));
+    root.querySelectorAll('.ota-event').forEach(row => {{
+      row.style.display = (filter === 'ALL' || row.dataset.cat === filter) ? '' : 'none';
+    }});
+  }}
+
+  document.addEventListener('click', event => {{
+    const button = event.target.closest('.ota-filter');
+    if (!button) return;
+    const panel = button.closest('.ota-main-panel') || document;
+    otaApplyActivityFilter(panel, button.dataset.filter);
+  }});
+
+  async function otaRefreshVisiblePanel() {{
+    if (document.hidden) return;
+    const current = document.querySelector('.ota-main-panel.active');
+    if (!current || !current.dataset.mainPanel) return;
+    const name = current.dataset.mainPanel;
+    const focused = document.activeElement;
+    if (focused && current.contains(focused) && /^(INPUT|SELECT|TEXTAREA)$/.test(focused.tagName)) return;
+
+    const pageX = window.scrollX;
+    const pageY = window.scrollY;
+    const filter = current.querySelector('.ota-filter.active')?.dataset.filter || null;
+    const wraps = Array.from(current.querySelectorAll('.table-wrap')).map(w => ({{left:w.scrollLeft, top:w.scrollTop}}));
+
+    try {{
+      const response = await fetch(window.location.href, {{cache:'no-store', credentials:'same-origin'}});
+      if (!response.ok) return;
+      const text = await response.text();
+      const freshDoc = new DOMParser().parseFromString(text, 'text/html');
+      const fresh = freshDoc.querySelector('.ota-main-panel[data-main-panel="' + CSS.escape(name) + '"]');
+      if (!fresh) return;
+      current.innerHTML = fresh.innerHTML;
+      if (filter) otaApplyActivityFilter(current, filter);
+      current.querySelectorAll('.table-wrap').forEach((w, i) => {{
+        if (wraps[i]) {{ w.scrollLeft = wraps[i].left; w.scrollTop = wraps[i].top; }}
+      }});
+      window.scrollTo(pageX, pageY);
+    }} catch (_) {{}}
+  }}
+
+  window.setInterval(otaRefreshVisiblePanel, 1500);
+}}
+</script>
 </section>
 
 <section class="ota-tab-panel" data-panel="artifacts">
