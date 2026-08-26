@@ -31,6 +31,7 @@
 #define OTA_AUTH_HEADER_MAX_LEN (OTA_CONFIG_MAX_TOKEN_LEN + 16)
 #define OTA_SHA256_HEX_LEN 64
 #define OTA_SHA256_HEADER "X-Firmware-SHA256"
+#define OTA_SUCCESS_REPORT_DELAY_MS 1200
 
 static const char *TAG = "ota_service";
 typedef struct { char payload[OTA_CONFIG_MAX_PAYLOAD_LEN + 1]; size_t payload_len; } ota_payload_request_t;
@@ -185,7 +186,12 @@ static esp_err_t download_and_install(const ota_config_t *config)
     ret = esp_ota_end(ota_handle); ota_started = false; if (ret != ESP_OK) goto cleanup;
     esp_app_desc_t partition_desc = {0}; ret = esp_ota_get_partition_description(target, &partition_desc); if (ret != ESP_OK) goto cleanup;
     ret = esp_ota_set_boot_partition(target); if (ret != ESP_OK) goto cleanup;
-    set_state(OTA_STATE_SUCCESS); s_progress = 100; ESP_LOGI(TAG, "OTA: rebooting into firmware %s", partition_desc.version); esp_restart();
+    set_state(OTA_STATE_SUCCESS);
+    s_progress = 100;
+    ESP_LOGI(TAG, "OTA success: allowing status/LED completion report before reboot into firmware %s", partition_desc.version);
+    vTaskDelay(pdMS_TO_TICKS(OTA_SUCCESS_REPORT_DELAY_MS));
+    ESP_LOGI(TAG, "OTA: rebooting into firmware %s", partition_desc.version);
+    esp_restart();
 cleanup:
     memset(auth_header, 0, sizeof(auth_header)); memset(actual_sha256, 0, sizeof(actual_sha256)); memset(expected_sha256, 0, sizeof(expected_sha256));
     if (sha_started) mbedtls_sha256_free(&sha_ctx); if (ota_started) esp_ota_abort(ota_handle); if (client != NULL) { esp_http_client_close(client); esp_http_client_cleanup(client); } return ret;
