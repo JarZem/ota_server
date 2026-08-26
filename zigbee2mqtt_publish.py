@@ -217,7 +217,7 @@ def handle_zigbee2mqtt_publish(handler) -> None:
             raise ValueError("zigbee2mqtt_firmware_build_marker_mismatch")
         code = data.decode("utf-8")
         digest = hashlib.sha256(expected_name.encode() + b"\0" + data + b"\0").hexdigest()
-        cert, publisher = _validated_publisher(str(request.get("certificate") or ""))
+        cert, publisher, _certificate_pem = _validated_publisher(str(request.get("certificate") or ""))
         signature = _b64url_decode(str(request.get("signature") or ""))
         cert.public_key().verify(signature, PUBLISH_DOMAIN + project.encode() + b"|" + digest.encode(), ec.ECDSA(hashes.SHA256()))
 
