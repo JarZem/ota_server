@@ -17,7 +17,7 @@ static const char *TAG = "zigbee_ota_control";
 #define ZB_OTA_CONTROL_DEVICE_ID 0xff02
 #define OTA_STATUS_MONITOR_MS 250
 #define INITIAL_REPORT_RETRY_MS 500
-#define INITIAL_REPORT_REPEAT_COUNT 3
+#define INITIAL_REPORT_REPEAT_COUNT 1
 #define INITIAL_REPORT_REPEAT_MS 1000
 
 static bool s_enable_ota = false;
@@ -31,6 +31,13 @@ static bool network_ready(void)
     if (esp_zb_bdb_is_factory_new()) return false;
     const uint16_t short_addr = esp_zb_get_short_address();
     return short_addr != 0x0000 && short_addr != 0xfffe && short_addr != 0xffff;
+}
+
+static bool provisioning_terminal(zigbee_ota_status_t status)
+{
+    return status == ZIGBEE_OTA_STATUS_PROVISIONING_COMPLETE ||
+           status == ZIGBEE_OTA_STATUS_PROVISIONING_ERROR ||
+           status == ZIGBEE_OTA_STATUS_PROVISIONING_TIMEOUT;
 }
 
 static void set_manufacturer_attr_locked(uint16_t cluster_id, uint16_t attr_id, void *value)
@@ -58,18 +65,39 @@ static void publish_state(void)
 void zigbee_ota_control_set_status(zigbee_ota_status_t status)
 {
     if (s_status == (uint8_t)status) return;
+
     s_status = (uint8_t)status;
     set_manufacturer_attr_locked(ZIGBEE_OTA_STATUS_CLUSTER_ID, ZIGBEE_OTA_STATUS_ATTR_ID, &s_status);
+
+    /* Provisioning is one explicit attempt. A terminal state closes Enable OTA
+       before the state uplink is emitted, therefore no second T frame is needed
+       and the HELLO task cannot start another two-minute retry cycle. */
+    if (provisioning_terminal(status) && s_enable_ota) {
+        s_enable_ota = false;
+        set_manufacturer_attr_locked(ZIGBEE_OTA_ENABLE_CLUSTER_ID, ZIGBEE_OTA_ENABLE_ATTR_ID, &s_enable_ota);
+        ESP_LOGI(TAG, "Enable OTA=0 after terminal provisioning status=0x%02x", (unsigned)s_status);
+    }
+
     ESP_LOGI(TAG, "OTA Status=0x%02x", (unsigned)s_status);
     publish_state();
+
+    if (status == ZIGBEE_OTA_STATUS_PROVISIONING_COMPLETE && ota_secure_session_is_provisioned()) {
+        const esp_err_t err = ota_check_auth_snapshot_provisioning_context();
+        if (err != ESP_OK) ESP_LOGW(TAG, "could not snapshot provisioning context for OTA CHECK: %s", esp_err_to_name(err));
+    }
 }
 
 void zigbee_ota_control_set_enabled(bool enabled)
 {
+    const bool changed = s_enable_ota != enabled;
     s_enable_ota = enabled;
-    set_manufacturer_attr_locked(ZIGBEE_OTA_ENABLE_CLUSTER_ID, ZIGBEE_OTA_ENABLE_ATTR_ID, &s_enable_ota);
-    ESP_LOGI(TAG, "Enable OTA=%u", s_enable_ota ? 1U : 0U);
-    publish_state();
+
+    if (changed) {
+        set_manufacturer_attr_locked(ZIGBEE_OTA_ENABLE_CLUSTER_ID, ZIGBEE_OTA_ENABLE_ATTR_ID, &s_enable_ota);
+        ESP_LOGI(TAG, "Enable OTA=%u", s_enable_ota ? 1U : 0U);
+        publish_state();
+    }
+
     if (!enabled && ota_secure_session_is_provisioned()) {
         const esp_err_t err = ota_check_auth_snapshot_provisioning_context();
         if (err != ESP_OK) ESP_LOGW(TAG, "could not snapshot provisioning context for OTA CHECK: %s", esp_err_to_name(err));
