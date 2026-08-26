@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import threading
 import time
 
@@ -13,6 +15,7 @@ from ota_check_security import (
 )
 
 NOOP_PROVISION_PAYLOAD = "__OTA_PROVISIONING_ALREADY_SECURE__"
+OPTIONS_PATH = "/data/options.json"
 _pending = {}
 _lock = threading.Lock()
 
@@ -91,3 +94,62 @@ def consume_dispatch_token(token: str, device_id: str, sha256_hex: str) -> bool:
             (now, device_id, str(sha256_hex).lower(), token_hash, now),
         )
     return result.rowcount == 1
+
+
+def secure_provisioning_ui_state(device_id: str) -> dict | None:
+    """Return UI provisioning state from the same durable context used by OTA CHECK."""
+    try:
+        normalized = normalize_device_id(device_id)
+    except Exception:
+        return None
+
+    with db_connect() as conn:
+        row = conn.execute(
+            """
+            SELECT provision_counter, provision_random, provision_context_updated_at
+            FROM device_certificates
+            WHERE device_id=?
+            """,
+            (normalized,),
+        ).fetchone()
+    if not row:
+        return None
+
+    counter = int(row.get("provision_counter") or 0)
+    random8 = bytes(row.get("provision_random") or b"")
+    if counter <= 0 or len(random8) != 8:
+        return None
+
+    options = {}
+    try:
+        if os.path.isfile(OPTIONS_PATH):
+            with open(OPTIONS_PATH, "r", encoding="utf-8") as f:
+                options = json.load(f)
+    except Exception:
+        options = {}
+
+    return {
+        "device_id": normalized,
+        "status": "PROVISIONED",
+        "wifi_ssid": str(options.get("wifi_ssid") or ""),
+        "wifi_security": str(options.get("wifi_security") or ""),
+        "wifi_channel": int(options.get("wifi_channel") or 0),
+        "ota_host": str(options.get("ota_host") or ""),
+        "ota_port": int(options.get("ota_port") or 8443),
+        "firmware_filename": None,
+        "firmware_sha256": None,
+        "transport": "secure-zigbee",
+        "error": None,
+        "updated_at": int(row.get("provision_context_updated_at") or 0),
+        "provision_counter": counter,
+    }
+
+
+# server_mysql imports this module only after server.py is loaded. Override the
+# legacy UI getter here so the ESP table reflects the secure durable context,
+# not the obsolete device_provisioning table.
+try:
+    import server as _server
+    _server.get_device_provisioning = secure_provisioning_ui_state
+except Exception:
+    pass
